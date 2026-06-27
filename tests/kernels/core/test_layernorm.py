@@ -7,6 +7,7 @@ import torch
 from tests.kernels.quant_utils import FP8_DTYPE
 from tests.kernels.utils import opcheck
 from vllm import ir
+from vllm.model_executor.layers.gemma_rms_norm import can_use_gemma_rms_norm
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -238,3 +239,49 @@ def test_gemma_rms_norm_mixed_input_weight_dtype(default_vllm_config) -> None:
 
     assert out.dtype == x.dtype
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("strided_input", [False, True])
+@torch.inference_mode()
+def test_gemma_rms_norm(
+    default_vllm_config,
+    num_tokens: int,
+    hidden_size: int,
+    add_residual: bool,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+    strided_input: bool,
+) -> None:
+    set_random_seed(seed)
+    torch.set_default_device(device)
+    # Gemma keeps an fp32 weight while activations may be fp16/bf16.
+    layer = GemmaRMSNorm(hidden_size).to(device=device)
+    layer.weight.data.normal_(mean=0.0, std=0.1)
+    last_dim = 2 * hidden_size if strided_input else hidden_size
+    x = torch.randn(num_tokens, last_dim, dtype=dtype)[..., :hidden_size]
+    assert x.is_contiguous() != strided_input
+    residual = torch.randn_like(x) if add_residual else None
+
+    # Guard against a silent native fallback making the test vacuous.
+    assert can_use_gemma_rms_norm(x, layer.weight, residual)
+
+    # forward_native may consume its inputs, so give it its own copy; the fused
+    # kernel does not mutate inputs, so it gets the (possibly strided) original.
+    ref = layer.forward_native(
+        x.clone(), residual.clone() if residual is not None else None
+    )
+    out = layer.forward_cuda(x, residual)
+    tol = _rms_norm_tolerance(dtype)
+
+    if add_residual:
+        torch.testing.assert_close(out[0], ref[0], **tol)
+        torch.testing.assert_close(out[1], ref[1], **tol)
+    else:
+        torch.testing.assert_close(out, ref, **tol)

@@ -12,6 +12,11 @@ from vllm import envs, ir
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
+from vllm.model_executor.layers.gemma_rms_norm import (
+    can_use_gemma_rms_norm,
+    gemma_fused_add_rms_norm,
+    gemma_rms_norm,
+)
 
 logger = init_logger(__name__)
 
@@ -161,6 +166,13 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if can_use_gemma_rms_norm(x, self.weight, residual):
+            if residual is None:
+                return gemma_rms_norm(x, self.weight, self.variance_epsilon)
+            return gemma_fused_add_rms_norm(
+                x, residual, self.weight, self.variance_epsilon
+            )
+
         return self.forward_native(x, residual)
 
 

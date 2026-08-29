@@ -16,6 +16,7 @@ from vllm.v1.kv_offload.base import (
 
 _BASE_PATH_HASH_LEN = 12
 _CONFIG_FILENAME = "config.json"
+MANIFEST_VERSION = 1
 
 
 class FileMapper:
@@ -40,6 +41,7 @@ class FileMapper:
         parallel_agnostic: bool = False,
         replicated_layout: bool = False,
         canonical_format: str | None = None,
+        kv_cache_layout: str | None = None,
     ):
         """
         Initialize the file mapper. Each worker constructs its own, but
@@ -75,6 +77,12 @@ class FileMapper:
         if canonical_format is not None:
             self.fields["canonical_format"] = canonical_format
         self.base_path: str = self._compute_base_path(root_dir, self.fields)
+        # Compatibility fields held out of the hash: adding one would move
+        # every existing deployment's namespace, and there is no historical
+        # default to omit against. They go in the manifest and are checked
+        # on open instead, as the NIXL connector already does for
+        # kv_cache_layout (see nixl/metadata.py).
+        self.compat_fields: dict = {"kv_cache_layout": kv_cache_layout}
 
     @classmethod
     def from_offloading_spec(
@@ -116,6 +124,7 @@ class FileMapper:
             ),
             replicated_layout=(parallel_agnostic and config.replicated_layout),
             canonical_format=canonical_format,
+            kv_cache_layout=config.kv_cache_layout,
         )
 
     def get_file_name(self, key: OffloadKey) -> str:
@@ -133,6 +142,34 @@ class FileMapper:
 
     def get_config_file_path(self) -> str:
         return f"{self.base_path}/{_CONFIG_FILENAME}"
+
+    def get_manifest(self) -> dict:
+        """Namespace identity plus the compatibility fields the hash omits."""
+        return {
+            "manifest_version": MANIFEST_VERSION,
+            "fields": dict(self.fields),
+            "compat": dict(self.compat_fields),
+        }
+
+    def compat_mismatches(self, manifest: dict) -> dict[str, tuple]:
+        """Compat fields on which a stored manifest disagrees with this run.
+
+        Args:
+            manifest: A manifest previously produced by `get_manifest`.
+
+        Returns:
+            Mapping of field name to `(stored, current)`. A field the
+            manifest does not carry is not a mismatch: it was written
+            before that field was recorded and cannot testify about it,
+            and rejecting it would discard every cache an older vLLM left
+            behind.
+        """
+        stored = manifest.get("compat") or {}
+        return {
+            name: (stored[name], value)
+            for name, value in self.compat_fields.items()
+            if name in stored and stored[name] != value
+        }
 
     @staticmethod
     def _compute_base_path(root_dir: str, fields: dict) -> str:

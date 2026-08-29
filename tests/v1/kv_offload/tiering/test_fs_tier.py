@@ -60,6 +60,7 @@ def _make_offloading_spec(
     world_size: int | None = None,
     replicated_layout: bool = False,
     is_parallelism_agnostic: bool = False,
+    kv_cache_layout: str | None = None,
 ) -> MagicMock:
     """Mock spec with an explicit global KV events flag."""
     if world_size is None:
@@ -86,6 +87,7 @@ def _make_offloading_spec(
             is_parallelism_agnostic=is_parallelism_agnostic,
         ),
         replicated_layout=replicated_layout,
+        kv_cache_layout=kv_cache_layout,
     )
     spec.blocks_per_chunk = 1
     spec.kv_events_config = OffloadingKVEventsConfig(
@@ -967,5 +969,61 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         reader.submit_load(make_job(2, [key(7)], [1], is_promotion=True))
         assert all(r.success for r in drain(reader))
         assert torch.allclose(reader_tensor[1], expected)
+    finally:
+        reader.shutdown()
+
+
+def _tier_at(tmp_path, layout):
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    return FileSystemTierManager(
+        offloading_spec=_make_offloading_spec(kv_cache_layout=layout),
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=2,
+        n_write_threads=2,
+    )
+
+
+def test_namespace_written_under_another_layout_is_not_served(tmp_path):
+    """Blocks a different layout wrote are byte-incompatible, so serve none.
+
+    The namespace hash cannot separate them, so without this the tier would
+    hit on them and return silently wrong KV.
+    """
+    writer = _tier_at(tmp_path, "LBNHC")
+    try:
+        writer.submit_store(make_job(1, [key(1)], [0]))
+        assert drain(writer)[0].success
+        assert lookup_and_wait(writer, [key(1)]) == [LookupResult.HIT]
+        stored_path = writer.file_mapper.get_file_name(key(1))
+    finally:
+        writer.shutdown()
+
+    reader = _tier_at(tmp_path, "LBHNC")
+    try:
+        assert reader.file_mapper.base_path == writer.file_mapper.base_path
+        assert lookup_and_wait(reader, [key(1)]) == [LookupResult.MISS]
+
+        reader.submit_store(make_job(2, [key(2)], [0]))
+        assert not drain(reader)[0].success
+        assert not os.path.exists(reader.file_mapper.get_file_name(key(2)))
+        assert os.path.exists(stored_path), "must not disturb the owner's blocks"
+    finally:
+        reader.shutdown()
+
+
+def test_namespace_reopened_under_the_same_layout_still_hits(tmp_path):
+    """Control for the above: only the layout difference disables the tier."""
+    writer = _tier_at(tmp_path, "LBNHC")
+    try:
+        writer.submit_store(make_job(1, [key(1)], [0]))
+        assert drain(writer)[0].success
+    finally:
+        writer.shutdown()
+
+    reader = _tier_at(tmp_path, "LBNHC")
+    try:
+        assert lookup_and_wait(reader, [key(1)]) == [LookupResult.HIT]
     finally:
         reader.shutdown()

@@ -13,8 +13,15 @@ Load path:
 
 File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
               (hash-based subdirectories to limit directory fan-out)
+
+Manifest:
+    <base_path>/config.json records the namespace identity together with
+    the compatibility fields the namespace hash omits, and is checked on
+    open. A namespace written by a run this one cannot read disables the
+    tier rather than being reinterpreted.
 """
 
+import contextlib
 import functools
 import json
 import os
@@ -39,7 +46,7 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     ReqContext,
 )
-from vllm.v1.kv_offload.file_mapper import FileMapper
+from vllm.v1.kv_offload.file_mapper import MANIFEST_VERSION, FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
@@ -60,6 +67,27 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 logger = init_logger(__name__)
+
+
+def _write_manifest(path: str, manifest: dict) -> None:
+    """Publish a manifest so a concurrent rank cannot read it half-written."""
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+    except OSError:
+        # Losing the manifest costs the next run its check, not this run its
+        # cache, so a read-only or full namespace must not fail startup.
+        logger.warning(
+            "Could not write KV offload manifest at '%s'", path, exc_info=True
+        )
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+
+
+def _reject_store() -> None:
+    raise RuntimeError("KV offload tier disabled: incompatible storage namespace")
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -174,14 +202,11 @@ class FileSystemTierManager(SecondaryTierManager):
             parallel_agnostic=True,
         )
 
-        # Write config file
         config_path = self.file_mapper.get_config_file_path()
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        if not os.path.exists(config_path):
-            with open(config_path, "w") as f:
-                json.dump(
-                    self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
-                )
+        # False leaves the tier inert: it serves misses and stores nothing,
+        # so an incompatible namespace costs a cold prefill, not correctness.
+        self._namespace_usable = self._sync_manifest(config_path)
 
         # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
         # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
@@ -203,12 +228,71 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
+    def _sync_manifest(self, config_path: str) -> bool:
+        """Reconcile this run against the manifest already in the namespace.
+
+        The namespace hash covers only the fields that must never alias, so a
+        directory can still have been written by a run whose bytes this one
+        cannot read. The manifest carries those remaining fields; this checks
+        them, and writes the manifest when the namespace has none or carries
+        an older version of it.
+
+        Args:
+            config_path: Path of the manifest inside the namespace.
+
+        Returns:
+            False if the namespace belongs to an incompatible run.
+        """
+        stored: dict | None = None
+        try:
+            with open(config_path) as f:
+                stored = json.load(f)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            # A torn manifest predates the atomic write below. It carries no
+            # verdict, so rewrite it rather than refuse the namespace.
+            logger.warning(
+                "Rewriting unreadable KV offload manifest at '%s': %s",
+                config_path,
+                exc,
+            )
+
+        if stored is not None:
+            mismatches = self.file_mapper.compat_mismatches(stored)
+            if mismatches:
+                logger.error(
+                    "Disabling KV offload tier '%s': '%s' was written with %s. "
+                    "Those blocks cannot be reinterpreted by this run, so it "
+                    "will prefill cold. Give each configuration its own "
+                    "root_dir to cache both.",
+                    self.tier_type,
+                    os.path.dirname(config_path),
+                    ", ".join(
+                        f"{name}={found!r}, not {mine!r}"
+                        for name, (found, mine) in sorted(mismatches.items())
+                    ),
+                )
+                return False
+            if stored.get("manifest_version") == MANIFEST_VERSION:
+                return True
+
+        # Nothing on disk records what wrote the blocks already here, so
+        # adopting the namespace leaves one unchecked reopen per namespace
+        # written before this manifest existed. The alternative -- refusing
+        # every such namespace -- discards those caches outright, which costs
+        # far more than the single window it closes.
+        _write_manifest(config_path, self.file_mapper.get_manifest())
+        return True
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if not self._namespace_usable:
+            return LookupResult.MISS
         result = self._lookup_manager.lookup(key, req_context)
         if result is None:
             return LookupResult.RETRY
@@ -216,6 +300,11 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
+        if not self._namespace_usable:
+            # Fail the job through the pool so the caller is not left waiting,
+            # and leave the foreign namespace untouched.
+            self._pool.enqueue_store(job_metadata.job_id, 1, [_reject_store])
+            return
         keys = list(job_metadata.keys)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys

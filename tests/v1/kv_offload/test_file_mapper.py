@@ -324,3 +324,42 @@ def test_replicated_layout_run_config_tp_invariant():
     tp2 = make_mapper_from_offloading_spec(tp_size=2, world_size=2, rank=0, **shared)
     tp4 = make_mapper_from_offloading_spec(tp_size=4, world_size=4, rank=2, **shared)
     assert tp2.get_run_config() == tp4.get_run_config()
+
+
+def test_kv_cache_layout_is_recorded_without_moving_the_namespace():
+    """Layout must reach the manifest but never the namespace hash.
+
+    There is no historical default to omit it against, so hashing it would
+    move every existing deployment's directory and orphan its blocks.
+    """
+    lbnhc = make_mapper_from_offloading_spec(kv_cache_layout="LBNHC")
+    lbhnc = make_mapper_from_offloading_spec(kv_cache_layout="LBHNC")
+
+    assert lbnhc.base_path == lbhnc.base_path
+    assert "kv_cache_layout" not in lbnhc.fields
+    assert lbnhc.get_run_config() == lbhnc.get_run_config()
+    assert lbnhc.get_manifest()["compat"]["kv_cache_layout"] == "LBNHC"
+
+
+def test_manifest_mismatch_is_reported_per_field():
+    """A namespace written under another layout must be recognised as foreign."""
+    written = make_mapper_from_offloading_spec(kv_cache_layout="LBNHC")
+    reader = make_mapper_from_offloading_spec(kv_cache_layout="LBHNC")
+
+    manifest = written.get_manifest()
+    assert reader.compat_mismatches(manifest) == {"kv_cache_layout": ("LBNHC", "LBHNC")}
+    assert written.compat_mismatches(manifest) == {}
+
+
+def test_manifest_written_before_a_field_existed_is_not_a_mismatch():
+    """Older vLLM wrote the hashed fields alone; that manifest cannot testify.
+
+    Treating its silence as a mismatch would discard every cache written
+    before this check existed.
+    """
+    reader = make_mapper_from_offloading_spec(kv_cache_layout="LBHNC")
+    legacy_on_disk = dict(
+        make_mapper_from_offloading_spec(kv_cache_layout="LBNHC").fields
+    )
+
+    assert reader.compat_mismatches(legacy_on_disk) == {}

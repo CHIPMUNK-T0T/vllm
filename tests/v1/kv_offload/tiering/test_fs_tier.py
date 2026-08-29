@@ -1089,3 +1089,87 @@ def test_per_process_seed_warns_that_the_namespace_can_never_be_reused(
         assert "random per process" in caplog.text
     finally:
         tier.shutdown()
+
+
+def _integrity_tier(tmp_path, verify: bool):
+    tensor = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=2,
+        n_write_threads=2,
+        verify_integrity=verify,
+    )
+    return tier, tensor
+
+
+def _flip_a_byte(path: str) -> None:
+    """Change one byte in place, so the block keeps its size and its name."""
+    with open(path, "r+b") as f:
+        original = f.read(1)
+        f.seek(0)
+        f.write(bytes([original[0] ^ 0xFF]))
+
+
+@pytest.mark.parametrize("verify", [True, False])
+def test_corrupt_block_is_served_only_without_verification(tmp_path, verify):
+    """A block whose bytes changed keeps its size, name and lookup verdict.
+
+    Every other check the tier makes passes, so with verification off the
+    model is handed KV that is not what was stored. The False case is the
+    control: it shows the check is what makes the difference, not the store.
+    """
+    tier, tensor = _integrity_tier(tmp_path, verify)
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert drain(tier)[0].success
+        path = tier.file_mapper.get_file_name(key(1))
+        _flip_a_byte(path)
+
+        assert lookup_and_wait(tier, [key(1)]) == [LookupResult.HIT]
+        tier.submit_load(make_job(2, [key(1)], [1], is_promotion=True))
+        result = drain(tier)[0]
+
+        assert result.success is not verify
+        assert os.path.exists(path) is not verify
+    finally:
+        tier.shutdown()
+
+
+def test_block_stored_before_checksums_existed_still_loads(tmp_path):
+    """Refusing unstamped blocks would discard every cache written earlier."""
+    writer, _ = _integrity_tier(tmp_path, verify=False)
+    try:
+        writer.submit_store(make_job(1, [key(1)], [0]))
+        assert drain(writer)[0].success
+    finally:
+        writer.shutdown()
+
+    reader, _ = _integrity_tier(tmp_path, verify=True)
+    try:
+        assert lookup_and_wait(reader, [key(1)]) == [LookupResult.HIT]
+        reader.submit_load(make_job(2, [key(1)], [1], is_promotion=True))
+        assert drain(reader)[0].success
+    finally:
+        reader.shutdown()
+
+
+def test_blocks_verified_before_a_corrupt_one_are_kept(tmp_path):
+    """Mirrors the short-read policy: a bad block fails its own load onward."""
+    tier, _ = _integrity_tier(tmp_path, verify=True)
+    try:
+        tier.submit_store(make_job(1, [key(1), key(2)], [0, 1]))
+        assert drain(tier)[0].success
+        _flip_a_byte(tier.file_mapper.get_file_name(key(2)))
+
+        tier.submit_load(make_job(2, [key(1), key(2)], [2, 3], is_promotion=True))
+        result = drain(tier)[0]
+        assert not result.success
+        # The good block is kept in the primary tier rather than recomputed.
+        assert result.successful_keys == (key(1),)
+        assert os.path.exists(tier.file_mapper.get_file_name(key(1)))
+        assert not os.path.exists(tier.file_mapper.get_file_name(key(2)))
+    finally:
+        tier.shutdown()

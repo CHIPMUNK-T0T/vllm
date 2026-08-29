@@ -7,6 +7,7 @@ import mmap
 import os
 import random
 import threading
+import zlib
 
 try:
     from vllm.fs_io_C import (  # pyright: ignore[reportMissingImports]
@@ -24,6 +25,12 @@ logger = logging.getLogger(__name__)
 
 # O_DIRECT is Linux-specific and not available on macOS
 O_DIRECT = getattr(os, "O_DIRECT", 0)
+
+# Extended attribute holding a block's CRC-32 as four big-endian bytes. It
+# rides alongside the file rather than inside it: the block is exactly one
+# aligned KV block, and a header or trailer would break both O_DIRECT
+# alignment and the size check that catches truncation.
+_CRC_XATTR = "user.vllm.kv_crc32"
 
 # Thread-local storage for unique temporary file suffixes
 _thread_local = threading.local()
@@ -64,6 +71,79 @@ def probe_o_direct(directory: str) -> bool:
         page.close()
         with contextlib.suppress(OSError):
             os.remove(path)
+
+
+def probe_xattr(directory: str) -> bool:
+    """Return whether user extended attributes work in *directory*.
+
+    They are unavailable on several filesystems a KV cache plausibly lives on
+    (many NFS mounts, older tmpfs), where the calls fail with EOPNOTSUPP.
+    Probe once so integrity checking can be declined with a warning rather
+    than failing on every block.
+    """
+    path = os.path.join(directory, f".xattr_probe{_get_tmp_suffix()}")
+    try:
+        with open(path, "wb"):
+            pass
+        os.setxattr(path, _CRC_XATTR, b"\x00\x00\x00\x00")
+        return os.getxattr(path, _CRC_XATTR) == b"\x00\x00\x00\x00"
+    except OSError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+
+def _stamp_blocks(
+    paths: list[str], view: memoryview, offsets: list[int], block_size: int
+) -> None:
+    """Record each stored block's checksum for a later load to check.
+
+    A block that could not be stamped is simply left unverifiable, so losing
+    the attribute costs a check and never a cache entry.
+    """
+    view_B = view.cast("B")
+    for path, offset in zip(paths, offsets):
+        crc = zlib.crc32(view_B[offset : offset + block_size])
+        try:
+            os.setxattr(path, _CRC_XATTR, crc.to_bytes(4, "big"))
+        except OSError as exc:
+            logger.warning("Could not checksum %s: %s", path, exc)
+
+
+def _verify_blocks(
+    paths: list[str], view: memoryview, offsets: list[int], block_size: int
+) -> None:
+    """Check loaded blocks against the checksums recorded when they were stored.
+
+    A block whose bytes changed under a correct size passes every other check
+    the tier makes, so it would be handed to the model as valid KV. Remove it
+    and fail the load from that block on, mirroring the short-read policy.
+
+    Raises:
+        OSError: On the first block that fails, carrying ``num_succeeded`` so
+            the caller can keep the blocks verified before it.
+    """
+    view_B = view.cast("B")
+    for i, (path, offset) in enumerate(zip(paths, offsets)):
+        try:
+            expected = os.getxattr(path, _CRC_XATTR)
+        except OSError:
+            # Stored before checksums were kept, or on a filesystem that
+            # dropped the attribute. Unverifiable is not corrupt.
+            continue
+        actual = zlib.crc32(view_B[offset : offset + block_size]).to_bytes(4, "big")
+        if actual == expected:
+            continue
+        try:
+            os.remove(path)
+        except OSError as cleanup_exc:
+            logger.warning("Failed to remove corrupt %s: %s", path, cleanup_exc)
+        exc = OSError(
+            f"Checksum mismatch: {path} holds {actual.hex()}, not {expected.hex()}"
+        )
+        exc.num_succeeded = i  # type: ignore[attr-defined]
+        raise exc
 
 
 def _ensure_dirs(path: str) -> None:
@@ -171,6 +251,7 @@ def batch_store_block(
     offsets: list[int],
     block_size: int,
     use_o_direct: bool = True,
+    verify_integrity: bool = False,
 ) -> None:
     """
     Store a batch of KV blocks from a shared buffer to disk in one call.
@@ -184,10 +265,13 @@ def batch_store_block(
         view_B = view.cast("B")
         view_slices = [view_B[x : x + block_size] for x in offsets]
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
-        return batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
+        batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
     else:
         for path, offset in zip(paths, offsets):
             _store_block(path, view, offset, block_size, use_o_direct)
+
+    if verify_integrity:
+        _stamp_blocks(paths, view, offsets, block_size)
 
 
 def batch_load_block(
@@ -196,6 +280,7 @@ def batch_load_block(
     offsets: list[int],
     block_size: int,
     use_o_direct: bool = True,
+    verify_integrity: bool = False,
 ) -> None:
     """
     Load a batch of KV blocks from disk into a shared buffer in one call.
@@ -204,13 +289,17 @@ def batch_load_block(
     Raises on first error (see _load_block for the delete-on-short-read policy).
     On failure the raised OSError carries ``num_succeeded`` = the number of
     blocks loaded before the failing one, so the tier can keep them.
+
+    With ``verify_integrity`` the loaded bytes are checked against the
+    checksums recorded at store time, which is the only check that can catch
+    a block whose content changed while its size did not.
     """
     _validate_offsets(view, offsets, block_size)
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
         view_slices = [view_B[x : x + block_size] for x in offsets]
-        return batch_load_block_C(paths, view_slices, use_o_direct)
+        batch_load_block_C(paths, view_slices, use_o_direct)
     else:
         for i, (path, offset) in enumerate(zip(paths, offsets)):
             try:
@@ -220,3 +309,6 @@ def batch_load_block(
                 # The C path sets the same attribute via PyObject_SetAttrString.
                 exc.num_succeeded = i  # type: ignore[attr-defined]
                 raise
+
+    if verify_integrity:
+        _verify_blocks(paths, view, offsets, block_size)

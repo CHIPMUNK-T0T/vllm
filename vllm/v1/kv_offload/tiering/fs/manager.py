@@ -61,6 +61,7 @@ from vllm.v1.kv_offload.tiering.fs.io import (
     batch_load_block,
     batch_store_block,
     probe_o_direct,
+    probe_xattr,
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
@@ -146,6 +147,7 @@ class FileSystemTierManager(SecondaryTierManager):
         primary_kv_view: memoryview,
         tier_type: str,
         root_dir: str,
+        verify_integrity: bool = False,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
@@ -158,6 +160,11 @@ class FileSystemTierManager(SecondaryTierManager):
             primary_kv_view: Memoryview of the primary tier's CPU KV cache.
             tier_type: Tier type identifier, set by SecondaryTierFactory.
             root_dir: Root directory for block files.
+            verify_integrity: Checksum each block on store and verify it on
+                load. This is the only check that catches a block whose
+                content changed while its size did not, but it reads every
+                byte a second time on both paths; measure before enabling on
+                a bandwidth-bound tier.
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
             enable_kv_events: Emit BlockStored KV events for blocks
@@ -227,6 +234,19 @@ class FileSystemTierManager(SecondaryTierManager):
                 root_dir,
                 tier_type,
             )
+
+        self._verify_integrity = verify_integrity
+        if verify_integrity and not probe_xattr(os.path.dirname(config_path)):
+            # Nothing to record checksums in, so verification would be a
+            # silent no-op. Say so rather than let the operator believe the
+            # cache is checked.
+            logger.warning(
+                "Extended attributes are unsupported at '%s'; the '%s' KV "
+                "offload tier cannot verify block integrity.",
+                root_dir,
+                tier_type,
+            )
+            self._verify_integrity = False
 
         self._pool = DualQueueThreadPool(
             n_read_threads,
@@ -311,6 +331,7 @@ class FileSystemTierManager(SecondaryTierManager):
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
             self._block_size,
             self._use_o_direct,
+            self._verify_integrity,
         )
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
 
@@ -332,6 +353,7 @@ class FileSystemTierManager(SecondaryTierManager):
                     offsets,
                     self._block_size,
                     self._use_o_direct,
+                    self._verify_integrity,
                 )
             except OSError as exc:
                 # Runs on the pool worker thread. Record how many blocks loaded

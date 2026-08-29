@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Object store secondary tier implementation."""
 
+import contextlib
 import ctypes
+import json
 import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar, NamedTuple
@@ -19,6 +21,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
 )
 from vllm.v1.kv_offload.file_mapper import FileMapper
+from vllm.v1.kv_offload.manifest import reconcile_manifest
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
@@ -52,6 +55,11 @@ NIXL_DEV_ID: int = 0
 _PROBE_ADDR: int = 0
 _PROBE_LEN: int = 1
 _PROBE_DEV_ID: int = 0
+
+# The manifest is stored as one fixed-size object so it can be read back
+# without a separate size query: JSON tolerates the trailing padding.
+_MANIFEST_BYTES: int = 1 << 16
+_MANIFEST_TIMEOUT_S: float = 30.0
 
 
 class TransferEntry(NamedTuple):
@@ -163,6 +171,10 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             root_dir, offloading_spec, parallel_agnostic=True
         )
         self._next_obj_dev_id: int = 1  # dev_id=0 is reserved for _exists() probes
+        # Reconciled on first use, not here: the prefix-cache hash seed the
+        # namespace must agree on is only settled by init_none_hash, which
+        # runs after the tiers are constructed. None means "not yet".
+        self._namespace_usable: bool | None = None
 
         self._probe_connectivity()
 
@@ -207,6 +219,135 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
                 f"SDK default credential chain is configured (IAM role, env "
                 f"vars, credential file). Error: {e}"
             ) from e
+
+    @property
+    def _usable(self) -> bool:
+        """Whether this run may read and write the namespace.
+
+        False leaves the tier inert: it serves misses and stores nothing, so
+        an incompatible namespace costs a cold prefill, not correctness. The
+        reconciliation is one round trip, on the first lookup only.
+        """
+        if self._namespace_usable is None:
+            self._namespace_usable = self._sync_manifest()
+        return self._namespace_usable
+
+    def _sync_manifest(self) -> bool:
+        usable, to_write = reconcile_manifest(
+            self._file_mapper,
+            self.tier_type,
+            self._file_mapper.base_path,
+            self._read_manifest(),
+        )
+        if to_write is not None:
+            self._write_manifest(to_write)
+        return usable
+
+    def _read_manifest(self) -> dict | None:
+        """The manifest stored in this namespace, or None if there is none."""
+        manifest_key = self._file_mapper.get_config_file_path()
+        if not self._exists(manifest_key):
+            return None
+        buf = (ctypes.c_char * _MANIFEST_BYTES)()
+        if not self._manifest_xfer(NIXL_READ, buf, manifest_key):
+            logger.warning(
+                "Could not read the KV offload manifest at '%s'; treating the "
+                "namespace as unrecorded.",
+                manifest_key,
+            )
+            return None
+        try:
+            return json.loads(bytes(buf).rstrip(b"\x00 \t\r\n").decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "Rewriting unreadable KV offload manifest at '%s': %s",
+                manifest_key,
+                exc,
+            )
+            return None
+
+    def _write_manifest(self, manifest: dict) -> None:
+        """Record what wrote this namespace, so the next run can check it."""
+        manifest_key = self._file_mapper.get_config_file_path()
+        payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+        if len(payload) > _MANIFEST_BYTES:
+            logger.warning(
+                "KV offload manifest for '%s' needs %d bytes but the object is "
+                "%d; leaving the namespace unrecorded.",
+                manifest_key,
+                len(payload),
+                _MANIFEST_BYTES,
+            )
+            return
+        buf = (ctypes.c_char * _MANIFEST_BYTES)()
+        buf.raw = payload.ljust(_MANIFEST_BYTES)
+        if not self._manifest_xfer(NIXL_WRITE, buf, manifest_key):
+            # Losing the manifest costs the next run its check, not this run
+            # its cache, so a read-only bucket must not fail startup.
+            logger.warning(
+                "Could not write the KV offload manifest at '%s'; the next run "
+                "will not be able to check this namespace.",
+                manifest_key,
+            )
+
+    def _manifest_xfer(self, op: str, buf, manifest_key: str) -> bool:
+        """Move the fixed-size manifest buffer to or from the object store.
+
+        Synchronous, unlike the block path: the verdict it feeds gates the
+        first lookup, and it happens once per process.
+
+        Returns:
+            True when the transfer completed.
+        """
+        addr = ctypes.addressof(buf)
+        dev_id = self._next_obj_dev_id
+        self._next_obj_dev_id += 1
+        dram_desc = obj_desc = dram_handle = obj_handle = xfer = None
+        try:
+            dram_desc = self._agent.register_memory(
+                [(addr, _MANIFEST_BYTES, NIXL_DEV_ID, "")], "DRAM"
+            )
+            obj_desc = self._agent.register_memory(
+                [(0, _MANIFEST_BYTES, dev_id, manifest_key)], "OBJ"
+            )
+            if dram_desc is None or obj_desc is None:
+                return False
+            dram_handle = self._agent.prep_xfer_dlist(
+                "NIXL_INIT_AGENT", [(addr, _MANIFEST_BYTES, NIXL_DEV_ID)], "DRAM"
+            )
+            obj_handle = self._agent.prep_xfer_dlist("ObjAgent", obj_desc.trim())
+            if not dram_handle or not obj_handle:
+                return False
+            xfer = self._agent.make_prepped_xfer(op, dram_handle, [0], obj_handle, [0])
+            if not xfer:
+                return False
+            state = self._agent.transfer(xfer)
+            deadline = time.monotonic() + _MANIFEST_TIMEOUT_S
+            while state == NIXL_PROC:
+                if time.monotonic() > deadline:
+                    logger.warning("Timed out on manifest %s at '%s'", op, manifest_key)
+                    return False
+                time.sleep(0.01)
+                state = self._agent.check_xfer_state(xfer)
+            return state == NIXL_DONE
+        except Exception:
+            logger.warning(
+                "Manifest %s failed at '%s'", op, manifest_key, exc_info=True
+            )
+            return False
+        finally:
+            for handle, release in (
+                (xfer, self._agent.release_xfer_handle),
+                (dram_handle, self._agent.release_dlist_handle),
+                (obj_handle, self._agent.release_dlist_handle),
+            ):
+                if handle:
+                    with contextlib.suppress(Exception):
+                        release(handle)
+            for desc in (dram_desc, obj_desc):
+                if desc is not None:
+                    with contextlib.suppress(Exception):
+                        self._agent.deregister_memory(desc)
 
     def _exists(self, obj_key: str) -> bool:
         results = self._agent.query_memory(
@@ -274,12 +415,21 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         )
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if not self._usable:
+            return LookupResult.MISS
         result = self._lookup_manager.lookup(key, req_context)
         if result is None:
             return LookupResult.RETRY
         return LookupResult.HIT if result else LookupResult.MISS
 
     def submit_store(self, job_metadata: TransferJob) -> None:
+        if not self._usable:
+            # Fail the job so the caller is not left waiting, and leave the
+            # foreign namespace untouched.
+            self._pending_results.append(
+                JobResult(job_id=job_metadata.job_id, success=False)
+            )
+            return
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         obj_keys = (self._file_mapper.get_file_name(k) for k in job_metadata.keys)

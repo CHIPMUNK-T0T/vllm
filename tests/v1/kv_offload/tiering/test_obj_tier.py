@@ -8,6 +8,8 @@ without S3 credentials or a live object store. They verify the manager's
 state machine: job submission, transfer completion polling, and lookup.
 """
 
+import ctypes
+import json
 import time
 import uuid
 from collections.abc import Callable
@@ -50,6 +52,7 @@ from vllm.v1.kv_offload.tiering.obj.manager import ObjectStoreSecondaryTierManag
 def _make_offloading_config(
     enable_kv_cache_events: bool,
     *,
+    kv_cache_layout: str | None = None,
     tp_size: int = 1,
     rank: int = 0,
     world_size: int | None = None,
@@ -79,6 +82,7 @@ def _make_offloading_config(
             is_parallelism_agnostic=is_parallelism_agnostic,
         ),
         replicated_layout=replicated_layout,
+        kv_cache_layout=kv_cache_layout,
     )
 
 
@@ -142,6 +146,10 @@ class MockNixlAgent:
 
     def __init__(self):
         self._stored_obj_keys: set[str] = set()
+        # Object payloads, for transfers that carry their own DRAM buffer.
+        self._objects: dict[str, bytes] = {}
+        self._pending_dram: tuple | None = None
+        self._pair: tuple | None = None
         # handle_id -> (op, [obj_keys])
         self._pending: dict[int, tuple[str, list[str]]] = {}
         self._handle_counter = 0
@@ -158,9 +166,21 @@ class MockNixlAgent:
     def _register_memory(self, descs, mem_type=None, backends=None):
         mock = MagicMock()
         mock.trim.return_value = MagicMock()
+        if mem_type == "DRAM" and descs:
+            self._pending_dram = descs[0]
         # Capture obj_keys from OBJ 4-tuples: (addr, len, dev_id, obj_key)
-        if mem_type == "OBJ" and descs:
+        elif mem_type == "OBJ" and descs:
             self._last_obj_keys = [d[3] for d in descs if d[3]]
+            # A DRAM buffer registered immediately before a single object is
+            # the manifest handshake, which is the only transfer bringing its
+            # own buffer; block transfers reuse the region registered at
+            # construction. Only those move real bytes here.
+            self._pair = (
+                (self._pending_dram, descs[0])
+                if self._pending_dram is not None and len(descs) == 1
+                else None
+            )
+            self._pending_dram = None
         return mock
 
     def deregister_memory(self, desc):
@@ -182,7 +202,11 @@ class MockNixlAgent:
     ):
         handle = MagicMock()
         handle._id = self._handle_counter
-        self._pending[self._handle_counter] = (op, list(self._last_obj_keys))
+        self._pending[self._handle_counter] = (
+            op,
+            list(self._last_obj_keys),
+            self._pair,
+        )
         self._handle_counter += 1
         return handle
 
@@ -192,9 +216,16 @@ class MockNixlAgent:
     def _check_xfer_state(self, handle):
         entry = self._pending.pop(handle._id, None)
         if entry:
-            op, obj_keys = entry
+            op, obj_keys, pair = entry
             if op == "WRITE":
                 self._stored_obj_keys.update(obj_keys)
+            if pair is not None:
+                (addr, size, _, _), (_, _, _, obj_key) = pair
+                if op == "WRITE":
+                    self._objects[obj_key] = ctypes.string_at(addr, size)
+                else:
+                    payload = self._objects.get(obj_key, b"")
+                    ctypes.memmove(addr, payload.ljust(size, b"\x00"), size)
         return "DONE"
 
     def release_xfer_handle(self, handle):
@@ -230,10 +261,19 @@ def _make_tier(
     num_blocks: int = 4,
     offloading_spec: SimpleNamespace = _OFFLOADING_SPEC,
     primary_kv_view: memoryview | None = None,
+    agent: "MockNixlAgent | None" = None,
+    reconcile: bool = True,
     **tier_kwargs,
 ) -> tuple[ObjectStoreSecondaryTierManager, MockNixlAgent]:
-    """Create a tier backed by a fresh MockNixlAgent."""
-    mock_agent = MockNixlAgent()
+    """Create a tier backed by a fresh MockNixlAgent.
+
+    Args:
+        reconcile: Settle the namespace manifest before returning. That is a
+            one-time round trip on first use, so tests that stub transfer
+            internals should get it out of the way first and see only block
+            traffic.
+    """
+    mock_agent = agent if agent is not None else MockNixlAgent()
     if primary_kv_view is None:
         tensor = torch.zeros((num_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
         primary_kv_view = memoryview(tensor.numpy())
@@ -252,6 +292,8 @@ def _make_tier(
             prefix=_RUN_PREFIX,
             **tier_kwargs,
         )
+    if reconcile:
+        assert tier._usable
     return tier, mock_agent
 
 
@@ -653,9 +695,12 @@ class TestObjTierKVEvents:
         poll, exactly one event is emitted and its keys belong to the
         successful job."""
         original = self.agent.check_xfer_state
-        self.agent.check_xfer_state = lambda h: "ERR" if h._id == 0 else original(h)
-        self.tier.submit_store(make_job(1, [key(1)], [0]))  # handle 0: fails
-        self.tier.submit_store(make_job(2, [key(2)], [1]))  # handle 1: succeeds
+        failing = self.agent._handle_counter  # the id the next transfer takes
+        self.agent.check_xfer_state = (
+            lambda h: "ERR" if h._id == failing else original(h)
+        )
+        self.tier.submit_store(make_job(1, [key(1)], [0]))  # fails
+        self.tier.submit_store(make_job(2, [key(2)], [1]))  # succeeds
         results = drain(self.tier)
         by_id = {r.job_id: r for r in results}
         assert not by_id[1].success
@@ -798,3 +843,51 @@ def test_obj_tier_replicated_layout_collapses_mapper_identity():
     finally:
         tp2_tier.shutdown()
         tp4_tier.shutdown()
+
+
+def _spec_with_layout(layout: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        config=_make_offloading_config(
+            enable_kv_cache_events=False, kv_cache_layout=layout
+        )
+    )
+
+
+def test_manifest_is_written_on_first_use_not_at_construction():
+    """The seed a namespace must agree on is settled after tiers are built."""
+    tier, agent = _make_tier(reconcile=False)
+    manifest_key = tier._file_mapper.get_config_file_path()
+    assert manifest_key not in agent._objects
+    assert lookup_and_wait(tier, [key(1)]) == [LookupResult.MISS]
+    assert json.loads(agent._objects[manifest_key])["compat"]["kv_cache_layout"] is None
+
+
+def test_namespace_written_under_another_layout_is_not_served():
+    """Blocks a different layout wrote are byte-incompatible, so serve none.
+
+    The namespace hash cannot separate them, so without this the tier would
+    hit on them and hand the model KV it cannot interpret.
+    """
+    store = MockNixlAgent()
+    writer, _ = _make_tier(offloading_spec=_spec_with_layout("LBNHC"), agent=store)
+    writer.submit_store(make_job(1, [key(1)], [0]))
+    assert drain(writer)[0].success
+
+    reader, _ = _make_tier(
+        offloading_spec=_spec_with_layout("LBHNC"), agent=store, reconcile=False
+    )
+    assert reader._file_mapper.base_path == writer._file_mapper.base_path
+    assert lookup_and_wait(reader, [key(1)]) == [LookupResult.MISS]
+    reader.submit_store(make_job(2, [key(2)], [0]))
+    assert not drain(reader)[0].success
+
+
+def test_namespace_reopened_under_the_same_layout_still_hits():
+    """Control for the above: only the layout difference disables the tier."""
+    store = MockNixlAgent()
+    writer, _ = _make_tier(offloading_spec=_spec_with_layout("LBNHC"), agent=store)
+    writer.submit_store(make_job(1, [key(1)], [0]))
+    assert drain(writer)[0].success
+
+    reader, _ = _make_tier(offloading_spec=_spec_with_layout("LBNHC"), agent=store)
+    assert lookup_and_wait(reader, [key(1)]) == [LookupResult.HIT]

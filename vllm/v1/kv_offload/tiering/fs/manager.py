@@ -38,7 +38,6 @@ except ImportError:
 from typing_extensions import override
 
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_utils import UNSHAREABLE_NONE_HASH_SEED
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
@@ -47,7 +46,8 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     ReqContext,
 )
-from vllm.v1.kv_offload.file_mapper import MANIFEST_VERSION, FileMapper
+from vllm.v1.kv_offload.file_mapper import FileMapper
+from vllm.v1.kv_offload.manifest import reconcile_manifest
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
@@ -250,34 +250,12 @@ class FileSystemTierManager(SecondaryTierManager):
     def _sync_manifest(self, config_path: str) -> bool:
         """Reconcile this run against the manifest already in the namespace.
 
-        The namespace hash covers only the fields that must never alias, so a
-        directory can still have been written by a run whose bytes this one
-        cannot read. The manifest carries those remaining fields; this checks
-        them, and writes the manifest when the namespace has none or carries
-        an older version of it.
-
         Args:
             config_path: Path of the manifest inside the namespace.
 
         Returns:
             False if the namespace belongs to an incompatible run.
         """
-        if self.file_mapper.resolved_compat()["hash_seed"] == (
-            UNSHAREABLE_NONE_HASH_SEED
-        ):
-            # vLLM warns that block hashes are irreproducible, but not that a
-            # persistent tier keeps writing blocks under them: every restart
-            # adds a generation of files nothing will ever look up again.
-            logger.warning(
-                "KV offload tier '%s' cannot reuse '%s' across restarts: the "
-                "prefix-cache hash seed is random per process, so this run "
-                "matches nothing already stored and nothing it stores will be "
-                "found again. Set PYTHONHASHSEED to a shared value, or use a "
-                "cryptographic prefix_caching_hash_algo.",
-                self.tier_type,
-                os.path.dirname(config_path),
-            )
-
         stored: dict | None = None
         try:
             with open(config_path) as f:
@@ -293,32 +271,15 @@ class FileSystemTierManager(SecondaryTierManager):
                 exc,
             )
 
-        if stored is not None:
-            mismatches = self.file_mapper.compat_mismatches(stored)
-            if mismatches:
-                logger.error(
-                    "Disabling KV offload tier '%s': '%s' was written with %s. "
-                    "Those blocks cannot be reinterpreted by this run, so it "
-                    "will prefill cold. Give each configuration its own "
-                    "root_dir to cache both.",
-                    self.tier_type,
-                    os.path.dirname(config_path),
-                    ", ".join(
-                        f"{name}={found!r}, not {mine!r}"
-                        for name, (found, mine) in sorted(mismatches.items())
-                    ),
-                )
-                return False
-            if stored.get("manifest_version") == MANIFEST_VERSION:
-                return True
-
-        # Nothing on disk records what wrote the blocks already here, so
-        # adopting the namespace leaves one unchecked reopen per namespace
-        # written before this manifest existed. The alternative -- refusing
-        # every such namespace -- discards those caches outright, which costs
-        # far more than the single window it closes.
-        _write_manifest(config_path, self.file_mapper.get_manifest())
-        return True
+        usable, to_write = reconcile_manifest(
+            self.file_mapper,
+            self.tier_type,
+            os.path.dirname(config_path),
+            stored,
+        )
+        if to_write is not None:
+            _write_manifest(config_path, to_write)
+        return usable
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:

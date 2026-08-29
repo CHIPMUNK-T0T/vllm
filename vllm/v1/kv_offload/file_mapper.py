@@ -7,6 +7,7 @@ import json
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
     canonical_format_id,
 )
+from vllm.v1.core.kv_cache_utils import none_hash_seed_fingerprint
 from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadKey,
@@ -81,7 +82,8 @@ class FileMapper:
         # every existing deployment's namespace, and there is no historical
         # default to omit against. They go in the manifest and are checked
         # on open instead, as the NIXL connector already does for
-        # kv_cache_layout (see nixl/metadata.py).
+        # kv_cache_layout (see nixl/metadata.py). Fields settled later than
+        # construction are added by `resolved_compat`.
         self.compat_fields: dict = {"kv_cache_layout": kv_cache_layout}
 
     @classmethod
@@ -143,12 +145,25 @@ class FileMapper:
     def get_config_file_path(self) -> str:
         return f"{self.base_path}/{_CONFIG_FILENAME}"
 
+    def resolved_compat(self) -> dict:
+        """Compat fields, including those only settled after engine start.
+
+        The prefix-cache hash seed is chosen by `init_none_hash`, which runs
+        after the offloading tiers are built, so it is read here rather than
+        in `__init__`. A tier that reconciles its manifest on first use
+        rather than at construction observes the resolved value.
+        """
+        return {
+            **self.compat_fields,
+            "hash_seed": none_hash_seed_fingerprint(),
+        }
+
     def get_manifest(self) -> dict:
         """Namespace identity plus the compatibility fields the hash omits."""
         return {
             "manifest_version": MANIFEST_VERSION,
             "fields": dict(self.fields),
-            "compat": dict(self.compat_fields),
+            "compat": self.resolved_compat(),
         }
 
     def compat_mismatches(self, manifest: dict) -> dict[str, tuple]:
@@ -167,7 +182,7 @@ class FileMapper:
         stored = manifest.get("compat") or {}
         return {
             name: (stored[name], value)
-            for name, value in self.compat_fields.items()
+            for name, value in self.resolved_compat().items()
             if name in stored and stored[name] != value
         }
 

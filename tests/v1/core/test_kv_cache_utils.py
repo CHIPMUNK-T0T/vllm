@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import importlib
+import os
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -297,6 +298,54 @@ def test_get_none_hash_seed_reports_effective_seed(monkeypatch):
         reloaded = importlib.reload(vllm.v1.core.kv_cache_utils)
         reloaded.init_none_hash(sha256)
         assert reloaded.get_none_hash_seed() == "12345"
+
+
+def test_seed_fingerprint_is_stable_and_does_not_disclose_the_seed(monkeypatch):
+    """Persistent tiers record which seed wrote a namespace, not the seed.
+
+    Where collision resistance depends on the seed staying unpredictable, a
+    copy on disk would hand an attacker the material to precompute colliding
+    blocks, so only a digest may be written.
+    """
+    import vllm.v1.core.kv_cache_utils
+
+    with monkeypatch.context() as m:
+        m.setenv("PYTHONHASHSEED", "12345")
+        reloaded = importlib.reload(vllm.v1.core.kv_cache_utils)
+        reloaded.init_none_hash(sha256)
+        fingerprint = reloaded.none_hash_seed_fingerprint()
+        assert "12345" not in fingerprint
+        assert fingerprint == reloaded.none_hash_seed_fingerprint()
+
+    with monkeypatch.context() as m:
+        m.setenv("PYTHONHASHSEED", "54321")
+        reloaded = importlib.reload(vllm.v1.core.kv_cache_utils)
+        reloaded.init_none_hash(sha256)
+        assert reloaded.none_hash_seed_fingerprint() != fingerprint
+
+
+def test_seed_fingerprint_reports_a_per_process_seed_as_unshareable(monkeypatch):
+    """A digest of a random seed says "another run", not "another config".
+
+    Reporting it as unshareable lets a persistent tier keep serving its own
+    process instead of disabling itself on every restart.
+    """
+    import vllm.v1.core.kv_cache_utils
+
+    with monkeypatch.context() as m:
+        m.delenv("PYTHONHASHSEED", raising=False)
+        reloaded = importlib.reload(vllm.v1.core.kv_cache_utils)
+        # What resolve_none_hash_seed returns for a non-cryptographic
+        # algorithm; xxhash itself is an optional dependency.
+        m.setattr(reloaded, "_NONE_HASH_SEED", os.urandom(32).hex())
+        assert (
+            reloaded.none_hash_seed_fingerprint() == reloaded.UNSHAREABLE_NONE_HASH_SEED
+        )
+
+        reloaded.init_none_hash(sha256)
+        assert (
+            reloaded.none_hash_seed_fingerprint() != reloaded.UNSHAREABLE_NONE_HASH_SEED
+        )
 
 
 def test_kv_cache_block():

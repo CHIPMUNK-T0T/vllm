@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.v1.core.kv_cache_utils as kv_cache_utils
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
@@ -1027,3 +1028,64 @@ def test_namespace_reopened_under_the_same_layout_still_hits(tmp_path):
         assert lookup_and_wait(reader, [key(1)]) == [LookupResult.HIT]
     finally:
         reader.shutdown()
+
+
+def test_manifest_is_written_on_first_use_not_at_construction(tmp_path):
+    """The seed a namespace must agree on is settled after tiers are built.
+
+    Reconciling in ``__init__`` would record the pre-init placeholder, so the
+    manifest must not exist until the tier is first used.
+    """
+    tier = _tier_at(tmp_path, "LBNHC")
+    try:
+        config_path = tier.file_mapper.get_config_file_path()
+        assert not os.path.exists(config_path)
+        assert lookup_and_wait(tier, [key(1)]) == [LookupResult.MISS]
+        assert os.path.exists(config_path)
+    finally:
+        tier.shutdown()
+
+
+def _set_hash_seed(monkeypatch, seed: str) -> None:
+    monkeypatch.setenv("PYTHONHASHSEED", seed)
+    monkeypatch.setattr(kv_cache_utils, "_NONE_HASH_SEED", seed)
+
+
+def test_namespace_written_under_another_hash_seed_is_not_served(tmp_path, monkeypatch):
+    """Block filenames chain from the seed, so a new seed cannot reuse them.
+
+    Left unchecked the tier misses on every block forever while still
+    storing, so the namespace grows a dead generation per seed change.
+    """
+    _set_hash_seed(monkeypatch, "1")
+    writer = _tier_at(tmp_path, "LBNHC")
+    try:
+        writer.submit_store(make_job(1, [key(1)], [0]))
+        assert drain(writer)[0].success
+    finally:
+        writer.shutdown()
+
+    _set_hash_seed(monkeypatch, "2")
+    reader = _tier_at(tmp_path, "LBNHC")
+    try:
+        assert reader.file_mapper.base_path == writer.file_mapper.base_path
+        assert lookup_and_wait(reader, [key(1)]) == [LookupResult.MISS]
+        reader.submit_store(make_job(2, [key(2)], [0]))
+        assert not drain(reader)[0].success
+    finally:
+        reader.shutdown()
+
+
+def test_per_process_seed_warns_that_the_namespace_can_never_be_reused(
+    tmp_path, monkeypatch, caplog
+):
+    """A random seed makes every stored block unreachable after restart."""
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    monkeypatch.setattr(kv_cache_utils, "_NONE_HASH_SEED", "a" * 64)
+    tier = _tier_at(tmp_path, "LBNHC")
+    try:
+        with caplog.at_level("WARNING"):
+            assert lookup_and_wait(tier, [key(1)]) == [LookupResult.MISS]
+        assert "random per process" in caplog.text
+    finally:
+        tier.shutdown()

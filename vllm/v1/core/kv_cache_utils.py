@@ -107,6 +107,10 @@ NONE_HASH: BlockHash
 # the hash algorithm is cryptographic.
 DEFAULT_NONE_HASH_SEED = "vllm-none-hash"
 
+# Reported by `none_hash_seed_fingerprint` when the seed is per-process
+# random, so block hashes are not reproducible across processes at all.
+UNSHAREABLE_NONE_HASH_SEED = "per-process"
+
 # Algorithms that are not collision resistant, so the seed must stay secret.
 _NON_CRYPTO_HASH_FUNCTIONS = frozenset({xxhash, xxhash_cbor})
 
@@ -141,6 +145,28 @@ def get_none_hash_seed() -> str:
     if _NONE_HASH_SEED is None:
         return DEFAULT_NONE_HASH_SEED
     return _NONE_HASH_SEED
+
+
+def none_hash_seed_fingerprint() -> str:
+    """A recordable identity for the seed NONE_HASH was derived from.
+
+    A persistent cache must be able to tell whether the block hashes it
+    holds were chained from the seed this run uses, but the seed itself
+    must not be written down: where collision resistance depends on it
+    staying unpredictable, a copy on disk would hand an attacker the
+    material to precompute colliding blocks (see `resolve_none_hash_seed`).
+
+    Returns:
+        `UNSHAREABLE_NONE_HASH_SEED` when the seed is fresh random bytes
+        per process, since a digest of it would differ on every restart and
+        so could not distinguish another run from another configuration.
+        Otherwise a digest of the seed, which is stable across processes
+        that agree on it and discloses nothing.
+    """
+    seed = get_none_hash_seed()
+    if os.getenv("PYTHONHASHSEED") is None and seed != DEFAULT_NONE_HASH_SEED:
+        return UNSHAREABLE_NONE_HASH_SEED
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
 
 
 def init_none_hash(hash_fn: Callable[[Any], bytes]):

@@ -17,8 +17,8 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 Manifest:
     <base_path>/config.json records the namespace identity together with
     the compatibility fields the namespace hash omits, and is checked on
-    open. A namespace written by a run this one cannot read disables the
-    tier rather than being reinterpreted.
+    first use. A namespace written by a run this one cannot read disables
+    the tier rather than being reinterpreted.
 """
 
 import contextlib
@@ -38,6 +38,7 @@ except ImportError:
 from typing_extensions import override
 
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_utils import UNSHAREABLE_NONE_HASH_SEED
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
@@ -131,6 +132,10 @@ class FileSystemTierManager(SecondaryTierManager):
         variable to the same value on all instances overrides the default seed,
         and is required to share a cache when using a non-cryptographic
         prefix-caching hash algorithm, which seeds ``NONE_HASH`` randomly.
+        The manifest records which seed a namespace was written under, so an
+        instance whose seed disagrees is told rather than left to miss on
+        every block; a randomly seeded one is warned that it can never reuse
+        the namespace at all.
     """
 
     medium: ClassVar[Medium] = Medium.STORAGE
@@ -202,11 +207,14 @@ class FileSystemTierManager(SecondaryTierManager):
             parallel_agnostic=True,
         )
 
-        config_path = self.file_mapper.get_config_file_path()
+        self._config_path = self.file_mapper.get_config_file_path()
+        config_path = self._config_path
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        # False leaves the tier inert: it serves misses and stores nothing,
-        # so an incompatible namespace costs a cold prefill, not correctness.
-        self._namespace_usable = self._sync_manifest(config_path)
+        # Reconciled on first use rather than here: one of the fields the
+        # namespace must agree on is the prefix-cache hash seed, which
+        # init_none_hash settles after the tiers are built (the p2p tier
+        # defers reading it for the same reason). None means "not yet".
+        self._namespace_usable: bool | None = None
 
         # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
         # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
@@ -228,6 +236,17 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
+    @property
+    def _usable(self) -> bool:
+        """Whether this run may read and write the namespace.
+
+        False leaves the tier inert: it serves misses and stores nothing, so
+        an incompatible namespace costs a cold prefill, not correctness.
+        """
+        if self._namespace_usable is None:
+            self._namespace_usable = self._sync_manifest(self._config_path)
+        return self._namespace_usable
+
     def _sync_manifest(self, config_path: str) -> bool:
         """Reconcile this run against the manifest already in the namespace.
 
@@ -243,6 +262,22 @@ class FileSystemTierManager(SecondaryTierManager):
         Returns:
             False if the namespace belongs to an incompatible run.
         """
+        if self.file_mapper.resolved_compat()["hash_seed"] == (
+            UNSHAREABLE_NONE_HASH_SEED
+        ):
+            # vLLM warns that block hashes are irreproducible, but not that a
+            # persistent tier keeps writing blocks under them: every restart
+            # adds a generation of files nothing will ever look up again.
+            logger.warning(
+                "KV offload tier '%s' cannot reuse '%s' across restarts: the "
+                "prefix-cache hash seed is random per process, so this run "
+                "matches nothing already stored and nothing it stores will be "
+                "found again. Set PYTHONHASHSEED to a shared value, or use a "
+                "cryptographic prefix_caching_hash_algo.",
+                self.tier_type,
+                os.path.dirname(config_path),
+            )
+
         stored: dict | None = None
         try:
             with open(config_path) as f:
@@ -291,7 +326,7 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        if not self._namespace_usable:
+        if not self._usable:
             return LookupResult.MISS
         result = self._lookup_manager.lookup(key, req_context)
         if result is None:
@@ -300,7 +335,7 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
-        if not self._namespace_usable:
+        if not self._usable:
             # Fail the job through the pool so the caller is not left waiting,
             # and leave the foreign namespace untouched.
             self._pool.enqueue_store(job_metadata.job_id, 1, [_reject_store])

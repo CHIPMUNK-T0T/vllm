@@ -17,7 +17,10 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 
 import functools
 import json
+import math
 import os
+import threading
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
@@ -49,6 +52,12 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TransferJob,
 )
+from vllm.v1.kv_offload.tiering.fs.errors import (
+    IOErrorClass,
+    annotate,
+    classify,
+    errno_label,
+)
 from vllm.v1.kv_offload.tiering.fs.io import (
     batch_load_block,
     batch_store_block,
@@ -60,6 +69,9 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 logger = init_logger(__name__)
+
+# Prototype safety cap; the benefit over recomputation is not yet measured.
+_MAX_IO_RETRIES = 2
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -117,6 +129,7 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        io_retry_budget_seconds: float = 0.0,
     ):
         """
         Args:
@@ -132,7 +145,14 @@ class FileSystemTierManager(SecondaryTierManager):
                 cache events are enabled globally (kv_events_config).
             locality: Whether this tier's storage is LOCAL or REMOTE relative
                 to the publishing vLLM instance.
+            io_retry_budget_seconds: Cumulative failed-attempt time below which
+                a task may retry. Must be finite and nonnegative; 0 disables
+                retries. Includes the initial attempt and its successful
+                prefix, but excludes queue time. This is not a timeout: the
+                next attempt may exceed the budget or block indefinitely.
         """
+        if not math.isfinite(io_retry_budget_seconds) or io_retry_budget_seconds < 0:
+            raise ValueError("io_retry_budget_seconds must be finite and nonnegative")
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
 
@@ -159,6 +179,15 @@ class FileSystemTierManager(SecondaryTierManager):
         # the GIL that read cannot observe the finished job without the prior
         # write, so no extra lock is needed (get_finished is itself lock-free).
         self._load_progress: dict[JobId, int] = {}
+
+        # Shared by all pool workers; snapshots are read by the caller.
+        self._io_error_lock = threading.Lock()
+        self._io_error_counts: dict[tuple[str, str], int] = {}
+        self._io_retry_counts: dict[tuple[str, str], int] = {}
+        # Prototype suppression is per errno for this manager's lifetime.
+        self._permanent_reported: set[str] = set()
+        self._root_dir = root_dir
+        self._io_retry_budget = io_retry_budget_seconds
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -214,12 +243,66 @@ class FileSystemTierManager(SecondaryTierManager):
             return LookupResult.RETRY
         return LookupResult.HIT if result else LookupResult.MISS
 
+    def _may_retry(self, cls: IOErrorClass, spent: float, attempts: int) -> bool:
+        """Apply the attempt cap and the observed failed-attempt time gate."""
+        if cls is not IOErrorClass.TRANSIENT or self._io_retry_budget <= 0.0:
+            return False
+        return attempts < _MAX_IO_RETRIES and spent < self._io_retry_budget
+
+    def _record_io_retry(self, exc: OSError, *, is_load: bool) -> None:
+        """Account for an attempt that is about to be repeated."""
+        key = ("load" if is_load else "store", errno_label(exc))
+        with self._io_error_lock:
+            self._io_retry_counts[key] = self._io_retry_counts.get(key, 0) + 1
+
+    def io_retry_counts(self) -> dict[tuple[str, str], int]:
+        """Return a snapshot of retries keyed by (direction, errno label)."""
+        with self._io_error_lock:
+            return dict(self._io_retry_counts)
+
+    def _count_io_error(self, exc: OSError, *, is_load: bool) -> IOErrorClass:
+        """Count each failed attempt, including failures a retry recovers from."""
+        cls = classify(exc, is_load=is_load)
+        key = (cls.value, errno_label(exc))
+        with self._io_error_lock:
+            self._io_error_counts[key] = self._io_error_counts.get(key, 0) + 1
+        return cls
+
+    def _report_io_error(self, exc: OSError, cls: IOErrorClass) -> None:
+        """Annotate a terminal task failure for logging by the pool."""
+        first = True
+        label = errno_label(exc)
+        if cls is IOErrorClass.PERMANENT:
+            with self._io_error_lock:
+                first = label not in self._permanent_reported
+                self._permanent_reported.add(label)
+        annotate(exc, cls, first=first)
+        if cls is IOErrorClass.PERMANENT and first:
+            logger.warning(
+                "The '%s' KV offload tier hit a %s I/O error under '%s'. "
+                "This error is classified as permanent and will not be "
+                "retried. Further %s occurrences for this tier instance "
+                "are logged at debug level.",
+                self.tier_type,
+                label,
+                self._root_dir,
+                label,
+            )
+
+    def io_error_counts(self) -> dict[tuple[str, str], int]:
+        """Return a snapshot of failed attempts keyed by (class, errno label).
+
+        Includes attempts that a later repeat recovered from.
+        """
+        with self._io_error_lock:
+            return dict(self._io_error_counts)
+
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
         keys = list(job_metadata.keys)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys
-        task = functools.partial(
+        store = functools.partial(
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in keys],
             self._primary_kv_view,
@@ -227,7 +310,28 @@ class FileSystemTierManager(SecondaryTierManager):
             self._block_size,
             self._use_o_direct,
         )
-        self._pool.enqueue_store(job_metadata.job_id, 1, [task])
+
+        def store_task() -> None:
+            # Stores expose no progress count; both paths skip existing files.
+            spent = 0.0
+            attempts = 0
+            while True:
+                started = time.monotonic() if self._io_retry_budget > 0 else 0.0
+                try:
+                    store()
+                    return
+                except OSError as exc:
+                    if self._io_retry_budget > 0:
+                        spent += time.monotonic() - started
+                    cls = self._count_io_error(exc, is_load=False)
+                    if self._may_retry(cls, spent, attempts):
+                        self._record_io_retry(exc, is_load=False)
+                        attempts += 1
+                        continue
+                    self._report_io_error(exc, cls)
+                    raise
+
+        self._pool.enqueue_store(job_metadata.job_id, 1, [store_task])
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
@@ -240,31 +344,54 @@ class FileSystemTierManager(SecondaryTierManager):
         offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
 
         def load_task() -> None:
-            try:
-                batch_load_block(
-                    paths,
-                    self._primary_kv_view,
-                    offsets,
-                    self._block_size,
-                    self._use_o_direct,
-                )
-            except OSError as exc:
-                # Runs on the pool worker thread. Record how many blocks loaded
-                # before the failure so get_finished_jobs can keep them; this
-                # write precedes task_done, so the scheduler reads it safely
-                # under the GIL once the finished queue hands back this job.
-                num_succeeded = getattr(exc, "num_succeeded", 0)
-                self._load_progress[job_id] = num_succeeded
-                # Surfaces errno (e.g. EMFILE "Too many open files") for both
-                # the C and Python load paths.
-                logger.debug(
-                    "Load of %d blocks for job %s failed at block %d: %s",
-                    len(paths),
-                    job_id,
-                    num_succeeded,
-                    exc,
-                )
-                raise
+            # A repeat resumes at the block that failed: the blocks before it
+            # are already in the primary tier's slots.
+            pending_paths, pending_offsets = paths, offsets
+            completed = 0
+            spent = 0.0
+            attempts = 0
+            while True:
+                started = time.monotonic() if self._io_retry_budget > 0 else 0.0
+                try:
+                    batch_load_block(
+                        pending_paths,
+                        self._primary_kv_view,
+                        pending_offsets,
+                        self._block_size,
+                        self._use_o_direct,
+                    )
+                    return
+                except OSError as exc:
+                    if self._io_retry_budget > 0:
+                        spent += time.monotonic() - started
+                    # Runs on the pool worker thread. Record how many blocks
+                    # loaded before the failure so get_finished_jobs can keep
+                    # them; this write precedes task_done, so the scheduler
+                    # reads it safely under the GIL once the finished queue
+                    # hands back this job.
+                    advanced = getattr(exc, "num_succeeded", 0)
+                    completed += advanced
+                    self._load_progress[job_id] = completed
+                    cls = self._count_io_error(exc, is_load=True)
+                    if self._may_retry(cls, spent, attempts):
+                        self._record_io_retry(exc, is_load=True)
+                        attempts += 1
+                        pending_paths = pending_paths[advanced:]
+                        pending_offsets = pending_offsets[advanced:]
+                        continue
+                    self._report_io_error(exc, cls)
+                    # Surfaces errno (e.g. EMFILE "Too many open files") for
+                    # both the C and Python load paths.
+                    logger.debug(
+                        "Load of %d blocks for job %s failed at block %d "
+                        "after %d retries: %s",
+                        len(paths),
+                        job_id,
+                        completed,
+                        attempts,
+                        exc,
+                    )
+                    raise
 
         self._pool.enqueue_load(job_id, 1, [load_task])
 

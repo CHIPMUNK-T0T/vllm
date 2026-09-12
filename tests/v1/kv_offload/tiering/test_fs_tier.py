@@ -8,16 +8,24 @@ The tier manager writes KV cache blocks to disk and reads them back, verifying
 data integrity throughout the process.
 """
 
+import errno
+import logging
 import mmap
 import os
+import runpy
+import stat
+import sys
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
 
+import vllm.v1.kv_offload.tiering.fs.io as io_mod
+import vllm.v1.kv_offload.tiering.fs.manager as mgr_mod
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
@@ -37,6 +45,14 @@ from vllm.v1.kv_offload.config import (
 )
 from vllm.v1.kv_offload.tiering.base import TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.fs import errors as errors_mod
+from vllm.v1.kv_offload.tiering.fs.errors import (
+    IOErrorClass,
+    annotate,
+    classify,
+    errno_label,
+    log_level_for,
+)
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
 )
@@ -969,3 +985,576 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+@pytest.fixture
+def vllm_logs():
+    """Capture vLLM log records.
+
+    ``caplog`` cannot see them: the ``vllm`` logger sets ``propagate = False``,
+    so nothing reaches the root handler pytest installs.
+    """
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    handler = _Capture()
+    logger = logging.getLogger("vllm")
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield handler.records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+
+# ---------------------------------------------------------------------------
+# Errno classification (RFC #54363 item 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "code,is_load,expected",
+    [
+        (errno.ENOENT, True, "miss"),
+        (errno.ENOENT, False, "unknown"),
+        (errno.ESTALE, True, "transient"),
+        (errno.EIO, True, "transient"),
+        (errno.ENOSPC, False, "permanent"),
+        (errno.EROFS, False, "permanent"),
+        (errno.EACCES, True, "permanent"),
+    ],
+)
+def test_classify_errno(code, is_load, expected):
+    """A block that is simply gone is a miss, not a tier failure, and a
+    condition an operator must fix is not the same as one that may clear."""
+    exc = OSError(code, os.strerror(code))
+    assert classify(exc, is_load=is_load).value == expected
+
+
+def test_classifier_imports_without_optional_errno(monkeypatch):
+    """A platform without EREMOTEIO must still be able to import the FS tier."""
+    monkeypatch.delattr(errno, "EREMOTEIO", raising=False)
+    namespace = runpy.run_path(errors_mod.__file__)
+    result = namespace["classify"](OSError(errno.EIO, "injected"), is_load=True)
+    assert result.value == "transient"
+
+
+def test_unrecognised_errno_keeps_its_label():
+    """Unknown errno values retain their labels without becoming transient."""
+    exc = OSError(4095, "made up")
+    assert classify(exc, is_load=True) is IOErrorClass.UNKNOWN
+    assert errno_label(exc) == "errno_4095"
+
+    no_errno = OSError("short read: expected 64, read 32")
+    assert classify(no_errno, is_load=True) is IOErrorClass.UNKNOWN
+    assert errno_label(no_errno) == "unknown"
+
+
+@pytest.mark.parametrize("use_c_ext", [True, False])
+def test_load_miss_is_not_reported_as_an_error(
+    fs_tier, monkeypatch, use_c_ext, vllm_logs
+):
+    """A block removed between lookup and load is ordinary on shared storage
+    with an external evictor, so it must not look like an I/O failure."""
+    if use_c_ext and not io_mod._HAS_FSIO_C:
+        pytest.skip("fs_io_C extension not built")
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", use_c_ext)
+
+    tier, tensor = fs_tier
+    tensor[:] = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    keys = [key(i) for i in range(4)]
+    tier.submit_store(make_job(1, keys, list(range(4))))
+    drain(tier)
+    lookup_and_wait(tier, keys)
+
+    os.remove(tier.file_mapper.get_file_name(keys[1]))
+
+    tier.submit_load(make_job(2, keys, list(range(4)), is_promotion=True))
+    results = drain(tier)
+
+    assert [r.success for r in results] == [False]
+    assert tier.io_error_counts()[("miss", "ENOENT")] == 1
+    assert not [r for r in vllm_logs if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="root ignores the mode bits this test relies on"
+)
+def test_permanent_error_is_escalated_once(fs_tier, vllm_logs):
+    """A volume that has stopped accepting writes must say so once, instead of
+    repeating an indistinguishable error line for every job."""
+    tier, tensor = fs_tier
+    tensor[:] = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    # Block files live in a sibling of base_path, not inside it.
+    base = f"{tier.file_mapper.base_path}_r{tier.file_mapper.rank}"
+    os.makedirs(base, exist_ok=True)
+    mode = os.stat(base).st_mode
+    os.chmod(base, stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        for job_id in range(3):
+            tier.submit_store(make_job(10 + job_id, [key(100 + job_id)], [0]))
+            drain(tier)
+    finally:
+        os.chmod(base, mode)
+
+    warnings = [r for r in vllm_logs if r.levelno == logging.WARNING]
+    errors = [r for r in vllm_logs if r.levelno >= logging.ERROR]
+    assert len(warnings) == 1, "the operator-actionable line must appear once"
+    assert len(errors) == 1, "repeats of a known permanent fault must be quiet"
+    assert sum(tier.io_error_counts().values()) == 3
+
+
+def test_a_second_permanent_fault_is_still_escalated(fs_tier, vllm_logs, monkeypatch):
+    """Suppressing one permanent errno must not hide a different errno."""
+    tier, _ = fs_tier
+    codes = [errno.EACCES, errno.EACCES, errno.ENOSPC, errno.ENOSPC]
+    failures = iter(codes)
+
+    def stub(*args, **kwargs):
+        code = next(failures)
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(mgr_mod, "batch_store_block", stub)
+    for job_id, _ in enumerate(codes):
+        tier.submit_store(make_job(job_id, [key(job_id)], [0]))
+        drain(tier)
+
+    warned = [r.getMessage() for r in vllm_logs if r.levelno == logging.WARNING]
+    assert len(warned) == 2, "one line per distinct permanent errno"
+    assert "EACCES" in warned[0] and "ENOSPC" in warned[1]
+    assert len([r for r in vllm_logs if r.levelno == logging.ERROR]) == 2
+    assert tier.io_error_counts() == {
+        ("permanent", "EACCES"): 2,
+        ("permanent", "ENOSPC"): 2,
+    }
+
+
+def test_error_counts_survive_concurrent_failures(fs_tier):
+    """Every pool thread updates the same counters, so a plain
+    read-modify-write would lose failures under load.
+
+    ``counts[k] = counts.get(k, 0) + 1`` is several bytecodes, and the
+    interpreter may switch threads between them. At the default switch
+    interval it usually does not, which would leave this test passing over an
+    unsynchronised counter, so the interval is shortened to make the
+    interleaving actually happen.
+    """
+    tier, _ = fs_tier
+    threads_count, per_thread = 8, 2000
+
+    def hammer() -> None:
+        for _ in range(per_thread):
+            tier._count_io_error(OSError(errno.EIO, "injected"), is_load=True)
+
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=hammer) for _ in range(threads_count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(previous)
+
+    assert tier.io_error_counts()[("transient", "EIO")] == threads_count * per_thread
+
+
+def test_unclassified_error_still_reported_as_an_error():
+    """The pool must not go quiet for a failure no one classified."""
+    assert log_level_for(RuntimeError("not an OSError")) == logging.ERROR
+
+
+def test_repeat_of_a_known_permanent_fault_is_quiet():
+    """The escalation message promises later occurrences drop to debug."""
+    exc = OSError(errno.EROFS, "read-only")
+    annotate(exc, IOErrorClass.PERMANENT, first=True)
+    assert log_level_for(exc) == logging.ERROR
+    annotate(exc, IOErrorClass.PERMANENT, first=False)
+    assert log_level_for(exc) == logging.DEBUG
+
+
+# ---------------------------------------------------------------------------
+# Transient error retry (RFC #54363 item 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("budget", [-1.0, float("nan"), float("inf"), -float("inf")])
+def test_invalid_retry_budget_is_rejected(tmp_path, budget):
+    """Reject invalid budgets before creating files or starting workers."""
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    root = tmp_path / "unused"
+    with pytest.raises(ValueError, match="io_retry_budget_seconds"):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(root),
+            io_retry_budget_seconds=budget,
+        )
+    assert not root.exists()
+
+
+@pytest.fixture
+def fs_tier_retry(tmp_path, monkeypatch):
+    """Enable retries with a deterministic clock, independent of CI load."""
+    # Replace only the manager's reference, not the shared time module used
+    # by thread_pool and drain(). Tests of the time gate override this clock.
+    monkeypatch.setattr(mgr_mod, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=2,
+        n_write_threads=2,
+        io_retry_budget_seconds=0.05,
+    )
+    try:
+        yield tier, tensor
+    finally:
+        tier.shutdown()
+
+
+def _failing_io(code, times, *, is_load=True):
+    """Fail before I/O a fixed number of times, then run the real operation."""
+    state = {"n": 0}
+    real = io_mod.batch_load_block if is_load else io_mod.batch_store_block
+
+    def stub(paths, view, offsets, block_size, use_o_direct=True):
+        if state["n"] < times:
+            state["n"] += 1
+            exc = OSError(code, os.strerror(code))
+            if is_load:
+                exc.num_succeeded = 0  # type: ignore[attr-defined]
+            raise exc
+        return real(paths, view, offsets, block_size, use_o_direct)
+
+    return stub
+
+
+def _store_then_lookup(tier, tensor, count=4):
+    tensor[:] = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    keys = [key(i) for i in range(count)]
+    tier.submit_store(make_job(1, keys, list(range(count))))
+    drain(tier)
+    lookup_and_wait(tier, keys)
+    return keys
+
+
+def test_transient_failure_is_retried_and_recovers(fs_tier_retry, monkeypatch):
+    """A fault that clears must not cost the request a recompute."""
+    tier, tensor = fs_tier_retry
+    keys = _store_then_lookup(tier, tensor)
+    monkeypatch.setattr(mgr_mod, "batch_load_block", _failing_io(errno.EIO, times=1))
+
+    tier.submit_load(make_job(2, keys, list(range(4)), is_promotion=True))
+    results = drain(tier)
+
+    assert [r.success for r in results] == [True]
+    assert tier.io_retry_counts() == {("load", "EIO"): 1}
+    assert tier.io_error_counts() == {("transient", "EIO"): 1}
+
+
+@pytest.mark.parametrize("elapsed", [0.05, 0.08])
+@pytest.mark.parametrize("is_load", [True, False])
+def test_slow_failure_is_not_retried(fs_tier_retry, monkeypatch, elapsed, is_load):
+    """At or beyond the failed-attempt budget, no retry is submitted."""
+    tier, tensor = fs_tier_retry
+    keys = _store_then_lookup(tier, tensor)
+    ticks = iter([0.0, elapsed])
+    monkeypatch.setattr(
+        mgr_mod, "time", SimpleNamespace(monotonic=lambda: next(ticks, elapsed))
+    )
+    monkeypatch.setattr(
+        mgr_mod,
+        "batch_load_block" if is_load else "batch_store_block",
+        _failing_io(errno.EIO, times=1, is_load=is_load),
+    )
+
+    submit = tier.submit_load if is_load else tier.submit_store
+    submit(make_job(2, keys, list(range(4)), is_promotion=is_load))
+    results = drain(tier)
+
+    assert [r.success for r in results] == [False]
+    assert tier.io_retry_counts() == {}
+
+
+@pytest.mark.parametrize("is_load", [True, False])
+def test_retry_budget_accumulates_failed_attempts(fs_tier_retry, monkeypatch, is_load):
+    """Two individually cheap failures can exhaust the cumulative budget."""
+    tier, tensor = fs_tier_retry
+    keys = _store_then_lookup(tier, tensor)
+    ticks = iter([0.0, 0.03, 0.03, 0.06])
+    monkeypatch.setattr(
+        mgr_mod, "time", SimpleNamespace(monotonic=lambda: next(ticks, 0.06))
+    )
+    monkeypatch.setattr(
+        mgr_mod,
+        "batch_load_block" if is_load else "batch_store_block",
+        _failing_io(errno.EIO, times=2, is_load=is_load),
+    )
+
+    submit = tier.submit_load if is_load else tier.submit_store
+    submit(make_job(2, keys, list(range(4)), is_promotion=is_load))
+
+    assert [r.success for r in drain(tier)] == [False]
+    direction = "load" if is_load else "store"
+    assert tier.io_retry_counts() == {(direction, "EIO"): 1}
+    assert tier.io_error_counts() == {("transient", "EIO"): 2}
+
+
+@pytest.mark.parametrize("code", [errno.ENOENT, errno.EROFS, 4095])
+@pytest.mark.parametrize("is_load", [True, False])
+def test_nontransient_failure_is_not_retried(fs_tier_retry, monkeypatch, code, is_load):
+    """Miss, permanent and unknown errors each terminate the task."""
+    tier, tensor = fs_tier_retry
+    keys = _store_then_lookup(tier, tensor)
+    monkeypatch.setattr(
+        mgr_mod,
+        "batch_load_block" if is_load else "batch_store_block",
+        _failing_io(code, times=1, is_load=is_load),
+    )
+
+    submit = tier.submit_load if is_load else tier.submit_store
+    submit(make_job(2, keys, list(range(4)), is_promotion=is_load))
+    assert [r.success for r in drain(tier)] == [False]
+    assert tier.io_retry_counts() == {}
+
+
+@pytest.mark.parametrize("is_load", [True, False])
+def test_retry_is_off_by_default(fs_tier, monkeypatch, is_load):
+    """Disabled retries do not read a retry clock or repeat failed I/O."""
+    tier, tensor = fs_tier
+    clock = MagicMock(side_effect=AssertionError("retry clock is disabled"))
+    monkeypatch.setattr(mgr_mod, "time", SimpleNamespace(monotonic=clock))
+    keys = _store_then_lookup(tier, tensor)
+    operation = "batch_load_block" if is_load else "batch_store_block"
+    failing_io = MagicMock(side_effect=OSError(errno.EIO, "injected"))
+    monkeypatch.setattr(mgr_mod, operation, failing_io)
+
+    submit = tier.submit_load if is_load else tier.submit_store
+    submit(make_job(2, keys, list(range(4)), is_promotion=is_load))
+    results = drain(tier)
+
+    assert [r.success for r in results] == [False]
+    assert tier.io_retry_counts() == {}
+    assert tier.io_error_counts() == {("transient", "EIO"): 1}
+    failing_io.assert_called_once()
+    clock.assert_not_called()
+
+
+def _partial_load(fail_points, code=errno.EIO):
+    """Load stub that really reads a prefix, then fails at a chosen block.
+
+    ``fail_points`` is one prefix length per failure; afterwards the real
+    implementation runs. Reading the prefix for real is what makes the resume
+    observable: the blocks it copied must survive into the final result.
+    """
+    state = {"n": 0}
+    real = io_mod.batch_load_block
+
+    def stub(paths, view, offsets, block_size, use_o_direct=True):
+        if state["n"] < len(fail_points):
+            k = min(fail_points[state["n"]], len(paths))
+            state["n"] += 1
+            if k:
+                real(paths[:k], view, offsets[:k], block_size, use_o_direct)
+            exc = OSError(code, os.strerror(code))
+            exc.num_succeeded = k  # type: ignore[attr-defined]
+            raise exc
+        return real(paths, view, offsets, block_size, use_o_direct)
+
+    return stub
+
+
+def _distinct_blocks(tensor, count):
+    """Give each source block content no other block shares."""
+    tensor[:] = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    for i in range(count):
+        tensor[i] += float(i + 1) * 1000.0
+    return tensor[:count].clone()
+
+
+@pytest.mark.parametrize("use_c_ext", [True, False])
+@pytest.mark.parametrize("fail_points", [[2], [1, 1]])
+def test_retry_resumes_without_losing_or_repeating_data(
+    fs_tier_retry, monkeypatch, use_c_ext, fail_points
+):
+    """Every block must arrive in its own destination slot, whether it was
+    copied before a failure or after the resume."""
+    if use_c_ext and not io_mod._HAS_FSIO_C:
+        pytest.skip("fs_io_C extension not built")
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", use_c_ext)
+
+    tier, tensor = fs_tier_retry
+    expected = _distinct_blocks(tensor, 4)
+    keys = [key(i) for i in range(4)]
+    tier.submit_store(make_job(1, keys, list(range(4))))
+    drain(tier)
+    lookup_and_wait(tier, keys)
+
+    # Load into slots the store never touched, so leftover source data cannot
+    # stand in for a block the resume failed to copy.
+    dest = [4, 5, 6, 7]
+    tensor[4:8] = -7.0
+    monkeypatch.setattr(mgr_mod, "batch_load_block", _partial_load(fail_points))
+
+    tier.submit_load(make_job(2, keys, dest, is_promotion=True))
+    results = drain(tier)
+
+    assert [r.success for r in results] == [True]
+    assert torch.equal(tensor[4:8], expected)
+
+
+def test_partial_progress_accumulates_across_retries(fs_tier_retry, monkeypatch):
+    """When the retries run out, the keys reported as loaded must count every
+    block copied, not just the ones from the last attempt."""
+    tier, tensor = fs_tier_retry
+    expected = _distinct_blocks(tensor, 4)
+    keys = [key(i) for i in range(4)]
+    tier.submit_store(make_job(1, keys, list(range(4))))
+    drain(tier)
+    lookup_and_wait(tier, keys)
+
+    tensor[4:8] = -7.0
+    # One block per attempt, and the attempt cap stops it before the last.
+    monkeypatch.setattr(mgr_mod, "batch_load_block", _partial_load([1, 1, 1]))
+
+    tier.submit_load(make_job(2, keys, [4, 5, 6, 7], is_promotion=True))
+    results = drain(tier)
+
+    assert [r.success for r in results] == [False]
+    assert results[0].successful_keys == tuple(keys[:3])
+    assert torch.equal(tensor[4:7], expected[:3])
+
+
+@pytest.mark.parametrize("prefix", [0, 1])
+def test_non_oserror_preserves_only_confirmed_progress(
+    fs_tier_retry, monkeypatch, prefix, vllm_logs
+):
+    """Unexpected errors must not mark unread slots as successfully loaded."""
+    tier, tensor = fs_tier_retry
+    expected = _distinct_blocks(tensor, 2)
+    keys = [key(0), key(1)]
+    tier.submit_store(make_job(1, keys, [0, 1]))
+    assert all(r.success for r in drain(tier))
+    lookup_and_wait(tier, keys)
+    tensor[4:6] = -7.0
+    partial = _partial_load([prefix])
+    calls = 0
+
+    def fail(paths, view, offsets, block_size, use_o_direct=True):
+        nonlocal calls
+        calls += 1
+        if prefix and calls == 1:
+            partial(paths, view, offsets, block_size, use_o_direct)
+        raise RuntimeError("unexpected load failure")
+
+    monkeypatch.setattr(mgr_mod, "batch_load_block", fail)
+    tier.submit_load(make_job(2, keys, [4, 5], is_promotion=True))
+    results = drain(tier)
+
+    assert len(results) == 1 and not results[0].success
+    assert results[0].successful_keys == (tuple(keys[:prefix]) or None)
+    assert calls == prefix + 1
+    assert tier.io_retry_counts() == ({("load", "EIO"): 1} if prefix else {})
+    assert any(
+        r.levelno == logging.ERROR and "unexpected load failure" in r.getMessage()
+        for r in vllm_logs
+    )
+
+    # A subsequent transfer still completes on the same pool.
+    monkeypatch.setattr(mgr_mod, "batch_load_block", io_mod.batch_load_block)
+    tier.submit_load(make_job(3, keys, [4, 5], is_promotion=True))
+    assert [r.success for r in drain(tier)] == [True]
+    assert torch.equal(tensor[4:6], expected)
+
+
+@pytest.mark.parametrize("use_c_ext", [True, False])
+def test_store_retry_completes_the_batch(fs_tier_retry, monkeypatch, use_c_ext):
+    """A store restarts the whole batch, so the blocks the failed attempt had
+    already written must still be the right blocks afterwards."""
+    if use_c_ext and not io_mod._HAS_FSIO_C:
+        pytest.skip("fs_io_C extension not built")
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", use_c_ext)
+    tier, tensor = fs_tier_retry
+    expected = _distinct_blocks(tensor, 4)
+    keys = [key(i) for i in range(4)]
+
+    state = {"n": 0}
+    real_store = io_mod.batch_store_block
+
+    def stub(paths, view, offsets, block_size, use_o_direct=True):
+        if state["n"] == 0:
+            state["n"] += 1
+            real_store(paths[:2], view, offsets[:2], block_size, use_o_direct)
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real_store(paths, view, offsets, block_size, use_o_direct)
+
+    monkeypatch.setattr(mgr_mod, "batch_store_block", stub)
+    tier.submit_store(make_job(1, keys, list(range(4))))
+    results = drain(tier)
+
+    assert [r.success for r in results] == [True]
+    assert tier.io_retry_counts() == {("store", "EIO"): 1}
+
+    monkeypatch.setattr(mgr_mod, "batch_store_block", real_store)
+    lookup_and_wait(tier, keys)
+    tensor[4:8] = -7.0
+    tier.submit_load(make_job(2, keys, [4, 5, 6, 7], is_promotion=True))
+    assert [r.success for r in drain(tier)] == [True]
+    assert torch.equal(tensor[4:8], expected)
+
+
+def test_short_read_is_not_retried_on_the_python_path(fs_tier_retry, monkeypatch):
+    """A short read has already deleted the file it was reading. Repeating it
+    would find nothing and record detected corruption as an ordinary miss."""
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", False)
+    tier, tensor = fs_tier_retry
+    _distinct_blocks(tensor, 2)
+    keys = [key(i) for i in range(2)]
+    tier.submit_store(make_job(1, keys, [0, 1]))
+    drain(tier)
+    lookup_and_wait(tier, keys)
+
+    path = tier.file_mapper.get_file_name(keys[1])
+    with open(path, "r+b") as handle:
+        handle.truncate(os.path.getsize(path) // 2)
+
+    tier.submit_load(make_job(2, keys, [4, 5], is_promotion=True))
+    results = drain(tier)
+
+    assert [r.success for r in results] == [False]
+    assert tier.io_retry_counts() == {}
+    assert tier.io_error_counts() == {("unknown", "unknown"): 1}
+
+
+@pytest.mark.parametrize("is_load", [True, False])
+def test_a_fault_that_never_clears_gives_up(fs_tier_retry, monkeypatch, is_load):
+    """The attempt cap stops repeated fast failures even with budget left."""
+    tier, tensor = fs_tier_retry
+    keys = _store_then_lookup(tier, tensor)
+    monkeypatch.setattr(
+        mgr_mod,
+        "batch_load_block" if is_load else "batch_store_block",
+        _failing_io(errno.EIO, times=99, is_load=is_load),
+    )
+
+    submit = tier.submit_load if is_load else tier.submit_store
+    submit(make_job(2, keys, list(range(4)), is_promotion=is_load))
+    results = drain(tier)
+
+    assert [r.success for r in results] == [False]
+    direction = "load" if is_load else "store"
+    assert tier.io_retry_counts() == {(direction, "EIO"): 2}
+    assert tier.io_error_counts() == {("transient", "EIO"): 3}

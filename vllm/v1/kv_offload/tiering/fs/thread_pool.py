@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.tiering.base import JobId
+from vllm.v1.kv_offload.tiering.fs.errors import class_name, log_level_for
 
 logger = init_logger(__name__)
 
@@ -181,9 +182,11 @@ class DualQueueThreadPool:
                 job_finished, success, total_time = state.task_done(True, transfer_time)
             except Exception as exc:
                 transfer_time = time.monotonic() - start_time
-                logger.error(
-                    "Job %s block I/O failed: %s",
+                logger.log(
+                    log_level_for(exc),
+                    "Job %s block I/O failed (%s): %s",
                     state.job_id,
+                    class_name(exc),
                     exc,
                 )
                 job_finished, success, total_time = state.task_done(

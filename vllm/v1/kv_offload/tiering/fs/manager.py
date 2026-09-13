@@ -17,7 +17,6 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 
 import functools
 import json
-import math
 import os
 import threading
 import time
@@ -54,6 +53,7 @@ from vllm.v1.kv_offload.tiering.base import (
 )
 from vllm.v1.kv_offload.tiering.fs.errors import (
     IOErrorClass,
+    RetryPolicy,
     annotate,
     classify,
     errno_label,
@@ -69,9 +69,6 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 logger = init_logger(__name__)
-
-# Prototype safety cap; the benefit over recomputation is not yet measured.
-_MAX_IO_RETRIES = 2
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -129,7 +126,6 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
-        io_retry_budget_seconds: float = 0.0,
     ):
         """
         Args:
@@ -145,14 +141,7 @@ class FileSystemTierManager(SecondaryTierManager):
                 cache events are enabled globally (kv_events_config).
             locality: Whether this tier's storage is LOCAL or REMOTE relative
                 to the publishing vLLM instance.
-            io_retry_budget_seconds: Cumulative failed-attempt time below which
-                a task may retry. Must be finite and nonnegative; 0 disables
-                retries. Includes the initial attempt and its successful
-                prefix, but excludes queue time. This is not a timeout: the
-                next attempt may exceed the budget or block indefinitely.
         """
-        if not math.isfinite(io_retry_budget_seconds) or io_retry_budget_seconds < 0:
-            raise ValueError("io_retry_budget_seconds must be finite and nonnegative")
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
 
@@ -187,7 +176,8 @@ class FileSystemTierManager(SecondaryTierManager):
         # Prototype suppression is per errno for this manager's lifetime.
         self._permanent_reported: set[str] = set()
         self._root_dir = root_dir
-        self._io_retry_budget = io_retry_budget_seconds
+        # Not user-configurable: retries must not outlast a job deadline.
+        self._retry_policy = RetryPolicy()
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -242,12 +232,6 @@ class FileSystemTierManager(SecondaryTierManager):
         if result is None:
             return LookupResult.RETRY
         return LookupResult.HIT if result else LookupResult.MISS
-
-    def _may_retry(self, cls: IOErrorClass, spent: float, attempts: int) -> bool:
-        """Apply the attempt cap and the observed failed-attempt time gate."""
-        if cls is not IOErrorClass.TRANSIENT or self._io_retry_budget <= 0.0:
-            return False
-        return attempts < _MAX_IO_RETRIES and spent < self._io_retry_budget
 
     def _record_io_retry(self, exc: OSError, *, is_load: bool) -> None:
         """Account for an attempt that is about to be repeated."""
@@ -313,18 +297,19 @@ class FileSystemTierManager(SecondaryTierManager):
 
         def store_task() -> None:
             # Stores expose no progress count; both paths skip existing files.
+            policy = self._retry_policy
             spent = 0.0
             attempts = 0
             while True:
-                started = time.monotonic() if self._io_retry_budget > 0 else 0.0
+                started = time.monotonic() if policy.enabled else 0.0
                 try:
                     store()
                     return
                 except OSError as exc:
-                    if self._io_retry_budget > 0:
+                    if policy.enabled:
                         spent += time.monotonic() - started
                     cls = self._count_io_error(exc, is_load=False)
-                    if self._may_retry(cls, spent, attempts):
+                    if policy.allows(cls, attempts, spent):
                         self._record_io_retry(exc, is_load=False)
                         attempts += 1
                         continue
@@ -348,10 +333,11 @@ class FileSystemTierManager(SecondaryTierManager):
             # are already in the primary tier's slots.
             pending_paths, pending_offsets = paths, offsets
             completed = 0
+            policy = self._retry_policy
             spent = 0.0
             attempts = 0
             while True:
-                started = time.monotonic() if self._io_retry_budget > 0 else 0.0
+                started = time.monotonic() if policy.enabled else 0.0
                 try:
                     batch_load_block(
                         pending_paths,
@@ -362,7 +348,7 @@ class FileSystemTierManager(SecondaryTierManager):
                     )
                     return
                 except OSError as exc:
-                    if self._io_retry_budget > 0:
+                    if policy.enabled:
                         spent += time.monotonic() - started
                     # Runs on the pool worker thread. Record how many blocks
                     # loaded before the failure so get_finished_jobs can keep
@@ -373,7 +359,7 @@ class FileSystemTierManager(SecondaryTierManager):
                     completed += advanced
                     self._load_progress[job_id] = completed
                     cls = self._count_io_error(exc, is_load=True)
-                    if self._may_retry(cls, spent, attempts):
+                    if policy.allows(cls, attempts, spent):
                         self._record_io_retry(exc, is_load=True)
                         attempts += 1
                         pending_paths = pending_paths[advanced:]

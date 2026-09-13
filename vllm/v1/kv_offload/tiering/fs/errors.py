@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Filesystem I/O classification and terminal-error logging metadata.
+"""Filesystem I/O classification, retry policy and terminal-error logging.
 
-The prototype policy only retries known transient errnos. Unknown errors are
-counted but not retried. C short reads currently also use EIO; distinguishing
-them from device failures requires a separate signal from the I/O layer.
+Only known transient errnos are retried. Unknown errors, including detected
+corruption, which both I/O paths raise without an errno, are counted but not
+retried.
 """
 
 import errno as _errno
 import logging
+import math
+from dataclasses import dataclass
 from enum import Enum
 
-# Retry candidates, not a guarantee that the fault will clear.
+# Retry candidates, not a guarantee that the fault will clear. Resource
+# exhaustion (ENOMEM, EMFILE, ENFILE) is left out: an immediate repeat from the
+# same worker has no reason to succeed.
 _TRANSIENT = frozenset(
     {
         _errno.EAGAIN,
@@ -20,17 +24,8 @@ _TRANSIENT = frozenset(
         _errno.EIO,
         _errno.ESTALE,
         _errno.ETIMEDOUT,
-        _errno.EBUSY,
-        _errno.ENOMEM,
-        _errno.EMFILE,
-        _errno.ENFILE,
-        _errno.ECONNRESET,
     }
 )
-
-# Some platforms do not define remote-I/O errors.
-if hasattr(_errno, "EREMOTEIO"):
-    _TRANSIENT |= {_errno.EREMOTEIO}
 
 # Retrying the unchanged operation is not expected to help.
 _PERMANENT = frozenset(
@@ -58,6 +53,42 @@ class IOErrorClass(Enum):
     TRANSIENT = "transient"
     PERMANENT = "permanent"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """When a failed task may be repeated. Disabled by default.
+
+    ``budget_seconds`` bounds the time already spent in failed attempts, not
+    the next attempt, which may still block. It is a placeholder for a job
+    deadline, which is what should bound retries once one exists.
+    """
+
+    # The benefit over recomputation is not yet measured.
+    max_retries: int = 2
+    budget_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.budget_seconds) or self.budget_seconds < 0:
+            raise ValueError("budget_seconds must be finite and nonnegative")
+
+    @property
+    def enabled(self) -> bool:
+        return self.budget_seconds > 0.0
+
+    def allows(self, cls: IOErrorClass, attempts: int, spent: float) -> bool:
+        """Whether a failure may be repeated.
+
+        Args:
+            cls: The class of the failure.
+            attempts: Retries this task has already made.
+            spent: Cumulative time of this task's failed attempts.
+        """
+        return (
+            cls is IOErrorClass.TRANSIENT
+            and attempts < self.max_retries
+            and spent < self.budget_seconds
+        )
 
 
 # Preserve the original OSError, including its errno and num_succeeded.

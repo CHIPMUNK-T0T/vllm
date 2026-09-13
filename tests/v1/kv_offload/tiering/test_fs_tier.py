@@ -12,7 +12,6 @@ import errno
 import logging
 import mmap
 import os
-import runpy
 import stat
 import sys
 import threading
@@ -45,9 +44,9 @@ from vllm.v1.kv_offload.config import (
 )
 from vllm.v1.kv_offload.tiering.base import TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
-from vllm.v1.kv_offload.tiering.fs import errors as errors_mod
 from vllm.v1.kv_offload.tiering.fs.errors import (
     IOErrorClass,
+    RetryPolicy,
     annotate,
     classify,
     errno_label,
@@ -1027,6 +1026,8 @@ def vllm_logs():
         (errno.ENOENT, False, "unknown"),
         (errno.ESTALE, True, "transient"),
         (errno.EIO, True, "transient"),
+        (errno.EMFILE, True, "unknown"),
+        (errno.ENOMEM, False, "unknown"),
         (errno.ENOSPC, False, "permanent"),
         (errno.EROFS, False, "permanent"),
         (errno.EACCES, True, "permanent"),
@@ -1037,14 +1038,6 @@ def test_classify_errno(code, is_load, expected):
     condition an operator must fix is not the same as one that may clear."""
     exc = OSError(code, os.strerror(code))
     assert classify(exc, is_load=is_load).value == expected
-
-
-def test_classifier_imports_without_optional_errno(monkeypatch):
-    """A platform without EREMOTEIO must still be able to import the FS tier."""
-    monkeypatch.delattr(errno, "EREMOTEIO", raising=False)
-    namespace = runpy.run_path(errors_mod.__file__)
-    result = namespace["classify"](OSError(errno.EIO, "injected"), is_load=True)
-    assert result.value == "transient"
 
 
 def test_unrecognised_errno_keeps_its_label():
@@ -1188,19 +1181,11 @@ def test_repeat_of_a_known_permanent_fault_is_quiet():
 
 
 @pytest.mark.parametrize("budget", [-1.0, float("nan"), float("inf"), -float("inf")])
-def test_invalid_retry_budget_is_rejected(tmp_path, budget):
-    """Reject invalid budgets before creating files or starting workers."""
-    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
-    root = tmp_path / "unused"
-    with pytest.raises(ValueError, match="io_retry_budget_seconds"):
-        FileSystemTierManager(
-            offloading_spec=_MOCK_OFFLOADING_SPEC,
-            primary_kv_view=memoryview(tensor.numpy()),
-            tier_type="fs",
-            root_dir=str(root),
-            io_retry_budget_seconds=budget,
-        )
-    assert not root.exists()
+def test_invalid_retry_budget_is_rejected(budget):
+    """A NaN budget would silently never retry, and an infinite one would leave
+    only the attempt cap."""
+    with pytest.raises(ValueError, match="budget_seconds"):
+        RetryPolicy(budget_seconds=budget)
 
 
 @pytest.fixture
@@ -1217,8 +1202,8 @@ def fs_tier_retry(tmp_path, monkeypatch):
         root_dir=str(tmp_path),
         n_read_threads=2,
         n_write_threads=2,
-        io_retry_budget_seconds=0.05,
     )
+    tier._retry_policy = RetryPolicy(budget_seconds=0.05)
     try:
         yield tier, tensor
     finally:
@@ -1516,10 +1501,13 @@ def test_store_retry_completes_the_batch(fs_tier_retry, monkeypatch, use_c_ext):
     assert torch.equal(tensor[4:8], expected)
 
 
-def test_short_read_is_not_retried_on_the_python_path(fs_tier_retry, monkeypatch):
+@pytest.mark.parametrize("use_c_ext", [True, False])
+def test_short_read_is_not_retried(fs_tier_retry, monkeypatch, use_c_ext):
     """A short read has already deleted the file it was reading. Repeating it
     would find nothing and record detected corruption as an ordinary miss."""
-    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", False)
+    if use_c_ext and not io_mod._HAS_FSIO_C:
+        pytest.skip("fs_io_C extension not built")
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", use_c_ext)
     tier, tensor = fs_tier_retry
     _distinct_blocks(tensor, 2)
     keys = [key(i) for i in range(2)]

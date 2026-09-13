@@ -17,6 +17,10 @@ constexpr int kODirectFlag = O_DIRECT;
 constexpr int kODirectFlag = 0;
 #endif
 
+// Returned instead of an errno for a provable short read. Corruption is not an
+// errno condition: raising it as EIO would make it look like a device error.
+constexpr int kShortRead = -1;
+
 extern "C" {
 
 namespace {
@@ -78,12 +82,13 @@ inline int _store_block(const char* tmp_path, const char* dest_path,
 }
 
 // Core single-block load: dst/size are raw pointer + byte count. Returns 0
-// on success, or the errno of the failing step on failure. Removes the source
-// file ONLY on a provable short read (the read completed but returned fewer
-// bytes than requested): stores are atomic, so a too-short file is genuine
-// corruption. Open failures and read errors (bytes_read < 0) are
-// transient/ambiguous and leave the file untouched; a close failure after a
-// full read is harmless and does not fail the load.
+// on success, kShortRead on a provable short read, or the errno of the failing
+// step on any other failure. Removes the source file ONLY on a provable short
+// read (the read completed but returned fewer bytes than requested): stores
+// are atomic, so a too-short file is genuine corruption. Open failures and
+// read errors (bytes_read < 0) are transient/ambiguous and leave the file
+// untouched; a close failure after a full read is harmless and does not fail
+// the load.
 inline int _load_block(const char* source_path, char* dst, size_t size,
                        bool use_o_direct) {
   const int o_direct_flag = use_o_direct ? kODirectFlag : 0;
@@ -103,7 +108,7 @@ inline int _load_block(const char* source_path, char* dst, size_t size,
     // Provable short read: the block is genuinely corrupt, so remove it.
     close(fd);
     unlink(source_path);
-    return EIO;
+    return kShortRead;
   }
 
   // A close error after a successful full read is harmless: the data is
@@ -315,9 +320,14 @@ static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
   release_buffer_list(buffers);
 
   if (failed_index >= 0) {
-    // PyErr_SetFromErrnoWithFilename() reads the errno to format exception.
-    errno = failure_errno;
-    PyErr_SetFromErrnoWithFilename(PyExc_OSError, source_paths[failed_index]);
+    if (failure_errno == kShortRead) {
+      // No errno, matching the Python fallback's short-read OSError.
+      PyErr_Format(PyExc_OSError, "Short read: %s", source_paths[failed_index]);
+    } else {
+      // PyErr_SetFromErrnoWithFilename() reads the errno to format exception.
+      errno = failure_errno;
+      PyErr_SetFromErrnoWithFilename(PyExc_OSError, source_paths[failed_index]);
+    }
     // Attach the number of blocks that loaded before the failure so the tier
     // can keep them (partial success). failed_index == count of blocks read OK.
     PyObject *etype, *evalue, *etb;
